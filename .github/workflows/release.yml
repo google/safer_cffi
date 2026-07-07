@@ -2,13 +2,17 @@ name: Publish to crates.io
 on:
   push:
     tags: ['v*']
+
+permissions:
+  contents: read
+
 jobs:
   publish:
     runs-on: ubuntu-latest
     environment: release
     permissions:
       contents: read
-      id-token: write     # Required for OIDC token exchange
+      id-token: write
     steps:
     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
       with:
