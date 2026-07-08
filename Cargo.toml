@@ -1,0 +1,13 @@
+[package]
+name = "safer_cffi"
+description = "Building blocks for safer C/Rust interop."
+license = "MIT OR Apache-2.0"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+libc = "0.2.186"
+log = "0.4.33"
+
+[dev-dependencies]
+googletest = "0.14.3"
