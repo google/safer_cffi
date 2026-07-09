@@ -1,8 +1,8 @@
 # Building Blocks for Safer C FFI
 
-`safer_cffi` provides Rust primitives
-for replacing C libraries with memory-safe Rust implementations while
-maintaining full ABI compatibility with the original C headers.
+`safer_cffi` provides Rust primitives for replacing C libraries with memory-safe
+Rust implementations while maintaining full ABI compatibility with the original
+C headers.
 
 *   **[Pointer Trackers](#pointer-trackers)** — Manage the lifecycle of Rust
     objects handed to C as opaque handles or raw pointers, preventing
@@ -13,11 +13,6 @@ maintaining full ABI compatibility with the original C headers.
 
 **Tip:** Take a look at [`examples/`](examples/) for patterns and common use
 cases.
-
-## Contributing
-
-We want to be open and set the right expectations: We're currently not set up to
-accept contributions.
 
 ## Pointer Trackers
 
