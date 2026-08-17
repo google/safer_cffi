@@ -86,14 +86,17 @@ const fn slice_type_assertions<T>() {
     // If this ever becomes an issue, consider using `aligned_alloc` instead of `malloc`.
     // We currently favor the universal availability of `malloc` over supporting
     // complex types.
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", target_os = "ios"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
     const MALLOC_ALIGN: usize = core::mem::align_of::<libc::max_align_t>();
+
+    #[cfg(target_os = "windows")]
+    const MALLOC_ALIGN: usize = if cfg!(target_pointer_width = "64") { 16 } else { 8 };
 
     #[cfg(not(any(
         target_os = "linux",
         target_os = "macos",
-        target_os = "windows",
-        target_os = "ios"
+        target_os = "ios",
+        target_os = "windows"
     )))]
     const MALLOC_ALIGN: usize = {
         // Fallback for weird platforms: Do an approximation at compile time,
