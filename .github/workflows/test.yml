@@ -6,17 +6,18 @@
 # option. This file may not be copied, modified, or distributed
 # except according to those terms.
 
-[package]
-name = "safer_cffi"
-description = "Building blocks for safer C/Rust interop."
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/google/safer_cffi"
-version = "0.2.0"
-edition = "2024"
+name: Test
+on:
+  pull_request:
 
-[dependencies]
-libc = "0.2.186"
-log = "0.4.33"
+permissions:
+  contents: read
 
-[dev-dependencies]
-googletest = "0.14.3"
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      with:
+        persist-credentials: false
+    - run: cargo test --locked
