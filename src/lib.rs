@@ -33,8 +33,9 @@
 //!
 //! ## C Slices
 //!
-//! Many C structs contain `(*mut T, c_int)` field pairs representing dynamically-sized
-//! arrays. [`CSlicePtr`] and [`CSliceRefMut`] provide safe handles over these pairs:
+//! Many C structs contain `(*mut T, L)` field pairs representing dynamically-sized
+//! arrays (where `L` is an integer length type such as `c_int` or `usize`).
+//! [`CSlicePtr`] and [`CSliceRefMut`] provide safe handles over these pairs:
 //!
 //! - **[`CSlicePtr`]**: A `#[repr(transparent)]` wrapper around `*mut T` for use in
 //!   `#[repr(C)]` struct definitions. Provides [`with_len`](CSlicePtr::with_len) to get
@@ -56,7 +57,7 @@ pub(crate) mod opaque;
 pub(crate) mod raw;
 pub(crate) mod tracker;
 
-pub use c_slice::{CSlicePtr, CSliceRefMut};
+pub use c_slice::{CSliceLen, CSlicePtr, CSliceRefMut};
 pub use c_str::CStrRef;
 pub use errors::{AllocError, TrackerError};
 pub use handle::Handle;

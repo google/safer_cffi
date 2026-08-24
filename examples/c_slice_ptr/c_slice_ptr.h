@@ -19,7 +19,7 @@ extern "C" {
 
 typedef struct IntArray {
   int32_t* items;
-  int32_t item_count;
+  int32_t item_len;
 } IntArray;
 
 IntArray* create_array(void);

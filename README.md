@@ -7,6 +7,7 @@ C headers.
 *   **[Pointer Trackers](#pointer-trackers)** — Manage the lifecycle of Rust
     objects handed to C as opaque handles or raw pointers, preventing
     use-after-free and double-borrow bugs.
+
 *   **[Struct Field Helpers](#struct-field-helpers)** — Safe wrappers for common
     C struct field patterns (`*mut T`/`c_int` array pairs and `const char*`
     strings).
@@ -62,19 +63,22 @@ See [`examples/raw_tracker/`](examples/raw_tracker/) for a full example.
 
 ### C Slices — `CSlicePtr<T>`
 
-Many C structs contain `(*mut T, c_int)` pairs representing dynamically-sized
-arrays. `CSlicePtr` can be used in place of `*mut T` and provides a safe handle
-for access and manipulation.
+Many C structs contain `(*mut T, L)` pairs representing dynamically-sized arrays
+(where `L` is an integer length type such as `c_int` or `usize`). `CSlicePtr`
+can be used in place of `*mut T` and provides a safe handle for access and
+manipulation.
 
 *   **`CSlicePtr<T>`**:
 
-    *   `with_len(c_int)` → `&[T]` — shared slice view.
-    *   `with_len_mut(&mut c_int)` → `CSliceRefMut` — mutable handle.
+    *   `with_len(len)` → `&[T]` — shared slice view for any `len: L` where `L:
+        CSliceLen`.
+    *   `with_len_mut(&mut len)` → `CSliceRefMut<'_, T, L>` — mutable handle for
+        any `L: CSliceLen`.
     *   `clone_and_leak(&[T])` → `CSlicePtr<T>` — create a new CSlicePtr by
         cloning an existing slice.
 
-*   **`CSliceRefMut<'a, T>`**: A borrowed mutable handle. Implements `DerefMut`
-    to `&mut [T]`. Additional methods:
+*   **`CSliceRefMut<'a, T, L>`**: A borrowed mutable handle. Implements
+    `DerefMut` to `&mut [T]`. Additional methods:
 
     *   `add(T)` — append via `realloc`.
     *   `clear()` — drop all elements, free memory, reset to null/0.
@@ -85,19 +89,19 @@ Usage example:
 ```rust
 #[repr(C)]
 struct MyStruct {
-    // Safety invariant: the length of this array is `item_count`.
+    // Safety invariant: the length of this array is `item_len`.
     items: CSlicePtr<Item>,
-    item_count: c_int,
+    item_len: c_int,
 }
 
 impl MyStruct {
     fn items(&self) -> &[Item] {
-        // SAFETY: the length of `items` is `item_count`.
-        unsafe { self.items.with_len(self.item_count) }
+        // SAFETY: the length of `items` is `item_len`.
+        unsafe { self.items.with_len(self.item_len) }
     }
-    fn items_mut(&mut self) -> CSliceRefMut<'_, Item> {
-        // SAFETY: the length of `items` is `item_count`.
-        unsafe { self.items.with_len_mut(&mut self.item_count) }
+    fn items_mut(&mut self) -> CSliceRefMut<'_, Item, c_int> {
+        // SAFETY: the length of `items` is `item_len`.
+        unsafe { self.items.with_len_mut(&mut self.item_len) }
     }
 }
 

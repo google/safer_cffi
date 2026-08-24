@@ -10,20 +10,20 @@ use safer_cffi::{CSlicePtr, CSliceRefMut};
 
 #[repr(C)]
 pub struct IntArray {
-    // Safety invariant: the length of this array is `item_count`.
+    // Safety invariant: the length of this array is `item_len`.
     pub items: CSlicePtr<i32>,
-    pub item_count: i32,
+    pub item_len: i32,
 }
 
 impl IntArray {
     pub fn items(&self) -> &[i32] {
-        // SAFETY: the length of `items` is `item_count`.
-        unsafe { self.items.with_len(self.item_count) }
+        // SAFETY: the length of `items` is `item_len`.
+        unsafe { self.items.with_len(self.item_len) }
     }
 
-    pub fn items_mut(&mut self) -> CSliceRefMut<'_, i32> {
-        // SAFETY: the length of `items` is `item_count`.
-        unsafe { self.items.with_len_mut(&mut self.item_count) }
+    pub fn items_mut(&mut self) -> CSliceRefMut<'_, i32, i32> {
+        // SAFETY: the length of `items` is `item_len`.
+        unsafe { self.items.with_len_mut(&mut self.item_len) }
     }
 }
 
@@ -39,7 +39,7 @@ impl Drop for IntArray {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn create_array() -> Option<Box<IntArray>> {
-    Some(Box::new(IntArray { items: CSlicePtr::null(), item_count: 0 }))
+    Some(Box::new(IntArray { items: CSlicePtr::null(), item_len: 0 }))
 }
 
 #[unsafe(no_mangle)]
