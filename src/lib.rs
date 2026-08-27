@@ -49,6 +49,7 @@
 //! All use the **C allocator** (`malloc`/`free`) for allocations,
 //! ensuring compatibility with memory managed across the FFI boundary.
 
+pub(crate) mod alloc;
 pub(crate) mod c_slice;
 pub(crate) mod c_str;
 pub(crate) mod errors;
@@ -57,6 +58,8 @@ pub(crate) mod opaque;
 pub(crate) mod raw;
 pub(crate) mod tracker;
 
+pub use alloc::{CBox, LibcAlloc};
+pub use allocator_api2::alloc::Allocator;
 pub use c_slice::{CSliceLen, CSlicePtr, CSliceRefMut};
 pub use c_str::CStrRef;
 pub use errors::{AllocError, TrackerError};

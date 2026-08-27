@@ -27,16 +27,4 @@ impl<K: core::fmt::Debug> core::fmt::Display for TrackerError<K> {
 
 impl<K: core::fmt::Debug> std::error::Error for TrackerError<K> {}
 
-/// Memory allocation via the C allocator (`malloc` / `realloc`) failed.
-///
-/// This is a stable equivalent of [`std::alloc::AllocError`] (nightly-only).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AllocError;
-
-impl core::fmt::Display for AllocError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("C allocator failed (malloc/realloc returned null)")
-    }
-}
-
-impl std::error::Error for AllocError {}
+pub use allocator_api2::alloc::AllocError;
