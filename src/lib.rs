@@ -31,27 +31,30 @@
 //!     is allocated in the same memory location, pointers to the old object will now silently
 //!     point to the new object.
 //!
-//! ## C Slices
+//! ## C Slices and Vectors
 //!
 //! Many C structs contain `(*mut T, L)` field pairs representing dynamically-sized
 //! arrays (where `L` is an integer length type such as `c_int` or `usize`).
-//! [`CSlicePtr`] and [`CSliceRefMut`] provide safe handles over these pairs:
+//! [`CSlicePtr`] and [`CVecRefMut`] provide safe handles over these pairs:
 //!
 //! - **[`CSlicePtr`]**: A `#[repr(transparent)]` wrapper around `*mut T` for use in
 //!   `#[repr(C)]` struct definitions. Provides [`with_len`](CSlicePtr::with_len) to get
-//!   a `&[T]` slice, [`with_len_mut`](CSlicePtr::with_len_mut) to create a mutable handle,
-//!   and [`clone_and_leak`](CSlicePtr::clone_and_leak) to clone a Rust slice into a C-allocated buffer.
+//!   a `&[T]` slice, [`with_len_mut`](CSlicePtr::with_len_mut) to get a mutable `&mut [T]`
+//!   slice, [`with_len_vec_mut`](CSlicePtr::with_len_vec_mut) to create a mutable `CVecRefMut`
+//!   handle, and [`clone_and_leak`](CSlicePtr::clone_and_leak) to clone a Rust slice into a C-allocated buffer.
 //!
-//! - **[`CSliceRefMut`]** (exclusive): Provides mutable slice access via
-//!   [`DerefMut`](core::ops::DerefMut), plus [`add`](CSliceRefMut::add) and
-//!   [`clear`](CSliceRefMut::clear) for array mutation.
+//! - **[`CVecRefMut`]** (growable vector handle): Provides mutable slice access via
+//!   [`DerefMut`](core::ops::DerefMut), plus [`push_back`](CVecRefMut::push_back),
+//!   [`try_push_back`](CVecRefMut::try_push_back), [`clear`](CVecRefMut::clear),
+//!   [`replace`](CVecRefMut::replace), and [`swap`](CVecRefMut::swap) for array mutation.
 //!
-//! All use the **C allocator** (`malloc`/`free`) for allocations,
+//! All vector operations use the **C allocator** (`malloc`/`free`) for allocations,
 //! ensuring compatibility with memory managed across the FFI boundary.
 
 pub(crate) mod alloc;
 pub(crate) mod c_slice;
 pub(crate) mod c_str;
+pub(crate) mod c_vec;
 pub(crate) mod errors;
 pub(crate) mod handle;
 pub(crate) mod opaque;
@@ -60,8 +63,9 @@ pub(crate) mod tracker;
 
 pub use alloc::{CBox, LibcAlloc};
 pub use allocator_api2::alloc::Allocator;
-pub use c_slice::{CSliceLen, CSlicePtr, CSliceRefMut};
+pub use c_slice::{CSliceLen, CSlicePtr};
 pub use c_str::CStrRef;
+pub use c_vec::CVecRefMut;
 pub use errors::{AllocError, TrackerError};
 pub use handle::Handle;
 pub use opaque::OpaqueTracker;

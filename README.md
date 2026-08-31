@@ -72,17 +72,17 @@ manipulation.
 
     *   `with_len(len)` → `&[T]` — shared slice view for any `len: L` where `L:
         CSliceLen`.
-    *   `with_len_mut(&mut len)` → `CSliceRefMut<'_, T, L>` — mutable handle for
+    *   `with_len_mut(&mut len)` → `CVecRefMut<'_, T, L>` — mutable handle for
         any `L: CSliceLen`.
     *   `clone_and_leak(&[T])` → `CSlicePtr<T>` — create a new CSlicePtr by
         cloning an existing slice.
 
-*   **`CSliceRefMut<'a, T, L>`**: A borrowed mutable handle. Implements
+*   **`CVecRefMut<'a, T, L>`**: A borrowed mutable "vec-like" struct. Implements
     `DerefMut` to `&mut [T]`. Additional methods:
 
-    *   `add(T)` — append via `realloc`.
+    *   `push_back(T)` — append via `realloc`.
     *   `clear()` — drop all elements, free memory, reset to null/0.
-    *   `swap(&mut CSliceRefMut)` — swap two handles.
+    *   `swap(&mut CVecRefMut)` — swap two handles.
 
 Usage example:
 
@@ -99,9 +99,13 @@ impl MyStruct {
         // SAFETY: the length of `items` is `item_len`.
         unsafe { self.items.with_len(self.item_len) }
     }
-    fn items_mut(&mut self) -> CSliceRefMut<'_, Item, c_int> {
+    fn items_mut(&mut self) -> &mut [Item] {
         // SAFETY: the length of `items` is `item_len`.
         unsafe { self.items.with_len_mut(&mut self.item_len) }
+    }
+    fn items_mut_vec(&mut self) -> CVecRefMut<'_, Item, c_int> {
+        // SAFETY: the length of `items` is `item_len`.
+        unsafe { self.items.with_len_mut_vec(&mut self.item_len) }
     }
 }
 

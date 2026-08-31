@@ -6,7 +6,7 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use safer_cffi::{CSlicePtr, CSliceRefMut};
+use safer_cffi::{CSlicePtr, CVecRefMut};
 
 #[repr(C)]
 pub struct IntArray {
@@ -21,15 +21,20 @@ impl IntArray {
         unsafe { self.items.with_len(self.item_len) }
     }
 
-    pub fn items_mut(&mut self) -> CSliceRefMut<'_, i32, i32> {
+    pub fn items_mut(&mut self) -> &mut [i32] {
         // SAFETY: the length of `items` is `item_len`.
-        unsafe { self.items.with_len_mut(&mut self.item_len) }
+        unsafe { self.items.with_len_mut(self.item_len) }
+    }
+
+    pub fn items_vec_mut(&mut self) -> CVecRefMut<'_, i32, i32> {
+        // SAFETY: the length of `items` is `item_len`.
+        unsafe { self.items.with_len_vec_mut(&mut self.item_len) }
     }
 }
 
 impl Drop for IntArray {
     fn drop(&mut self) {
-        self.items_mut().clear();
+        self.items_vec_mut().clear();
     }
 }
 
@@ -50,7 +55,7 @@ pub extern "C" fn free_array(array: Option<Box<IntArray>>) {
 #[unsafe(no_mangle)]
 pub extern "C" fn append_to_array(array: Option<&mut IntArray>, item: i32) {
     if let Some(arr) = array {
-        arr.items_mut().add(item);
+        arr.items_vec_mut().push_back(item);
     }
 }
 
