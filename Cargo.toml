@@ -17,6 +17,7 @@ edition = "2024"
 [dependencies]
 libc = "0.2.186"
 log = "0.4.33"
+allocator_api2 = "0.2"
 
 [dev-dependencies]
 googletest = "0.14.3"
