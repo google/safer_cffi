@@ -38,9 +38,10 @@
 //! [`CSlicePtr`] and [`CVecRefMut`] provide safe handles over these pairs:
 //!
 //! - **[`CSlicePtr`]**: A `#[repr(transparent)]` wrapper around `*mut T` for use in
-//!   `#[repr(C)]` struct definitions. Provides [`with_len`](CSlicePtr::with_len) to get
-//!   a `&[T]` slice, [`with_len_mut`](CSlicePtr::with_len_mut) to get a mutable `&mut [T]`
-//!   slice, [`with_len_vec_mut`](CSlicePtr::with_len_vec_mut) to create a mutable `CVecRefMut`
+//!   `#[repr(C)]` struct definitions. Encodes the allocator type (defaulting to [`LibcAlloc`]).
+//!   Provides [`with_len`](CSlicePtr::with_len) to get a `&[T]` slice,
+//!   [`with_len_mut`](CSlicePtr::with_len_mut) to get a mutable `&mut [T]` slice,
+//!   [`with_len_vec_mut`](CSlicePtr::with_len_vec_mut) to create a mutable `CVecRefMut`
 //!   handle, and [`clone_and_leak`](CSlicePtr::clone_and_leak) to clone a Rust slice into a C-allocated buffer.
 //!
 //! - **[`CVecRefMut`]** (growable vector handle): Provides mutable slice access via
@@ -48,8 +49,9 @@
 //!   [`try_push_back`](CVecRefMut::try_push_back), [`clear`](CVecRefMut::clear),
 //!   [`replace`](CVecRefMut::replace), and [`swap`](CVecRefMut::swap) for array mutation.
 //!
-//! All vector operations use the **C allocator** (`malloc`/`free`) for allocations,
-//! ensuring compatibility with memory managed across the FFI boundary.
+//! All vector operations default to the **C allocator** (`malloc`/`free`) for allocations,
+//! ensuring compatibility with memory managed across the FFI boundary, and support custom
+//! [`Allocator`] implementations via `with_len_vec_mut_in` and `clone_and_leak_in`.
 
 pub(crate) mod alloc;
 pub(crate) mod c_slice;
@@ -59,6 +61,8 @@ pub(crate) mod errors;
 pub(crate) mod handle;
 pub(crate) mod opaque;
 pub(crate) mod raw;
+#[cfg(test)]
+pub(crate) mod testing;
 pub(crate) mod tracker;
 
 pub use alloc::{CBox, LibcAlloc};

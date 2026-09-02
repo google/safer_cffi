@@ -10,8 +10,8 @@
 //!
 //! These types centralise `unsafe` access to `(*mut T, L)` field pairs (where `L`
 //! is an integer length type such as `c_int` or `usize`).
-//! They ensure that all allocations and deallocations go through the **libc allocator**
-//! (`malloc`/`realloc`/`free`), which works even if the C and Rust allocators differ.
+//! They support generic memory allocators via [`core::alloc::Allocator`], defaulting to
+//! the [`LibcAlloc`] allocator (`malloc`/`realloc`/`free`).
 //!
 //! # Usage
 //!
@@ -69,9 +69,12 @@
 //! my_struct.items_vec_mut().clear();
 //! ```
 
+use crate::alloc::LibcAlloc;
 use crate::c_vec::CVecRefMut;
 use crate::errors::AllocError;
-use core::ptr;
+use allocator_api2::alloc::{Allocator, Layout};
+use core::marker::PhantomData;
+use core::ptr::{self, NonNull};
 
 /// The maximum slice length for type `T` that stays within the
 /// [`isize::MAX`]-byte limit required by [`core::slice::from_raw_parts`].
@@ -185,8 +188,8 @@ unsafe impl CSliceLen for i64 {}
 /// and [`clone_and_leak`](Self::clone_and_leak) to clone a Rust slice into a
 /// C-allocated buffer.
 ///
-/// Because it is `repr(transparent)`, it has the exact same layout as `*mut T`
-/// and can be used directly in `#[repr(C)]` struct definitions without
+/// The allocator `A` defaults to [`LibcAlloc`]. It has the exact same layout and ABI
+/// as `*mut T` and can be used directly in `#[repr(C)]` struct definitions without
 /// affecting ABI compatibility.
 ///
 /// # Safety Invariants
@@ -194,24 +197,26 @@ unsafe impl CSliceLen for i64 {}
 /// - The pointer is either null, or points to an owned array of `T`s of externally specified length
 ///   that is not accessed through any other pointer. The array of `T`s ought to also be initialized.
 /// - The pointer is always aligned for `T`.
-/// - If the pointer is non-null, it has been allocated with `malloc` (or `LibcAlloc`).
+/// - If the pointer is non-null, it has been allocated with the allocator `A` with layout
+///   matching `Layout::array::<T>(len)`.
 ///
 /// Additional invariants enforced by compile-time assertions in [`from_raw`]:
 /// - `T` is not a zero-sized type, i.e. `size_of::<T>() > 0`.
 /// - `T` is not over-aligned for a standard `malloc` call.
 #[repr(transparent)]
-pub struct CSlicePtr<T> {
+pub struct CSlicePtr<T, A = LibcAlloc> {
     ptr: *mut T,
+    _allocator: PhantomData<A>,
 }
 
-impl<T> CSlicePtr<T> {
+impl<T, A: Allocator> CSlicePtr<T, A> {
     /// Create a null `CSlicePtr`.
     pub const fn null() -> Self {
         const {
             slice_type_assertions::<T>();
         }
         // SAFETY: null pointers trivially satisfy all other safety invariants of CSlicePtr.
-        Self { ptr: ptr::null_mut() }
+        Self { ptr: ptr::null_mut(), _allocator: PhantomData }
     }
 
     /// Construct a `CSlicePtr` from a raw pointer.
@@ -219,12 +224,13 @@ impl<T> CSlicePtr<T> {
     /// # Safety
     ///
     /// The caller must ensure that `raw` satisfies all the safety invariants of
-    /// [`CSlicePtr`].
+    /// [`CSlicePtr`], including that if non-null, it points to memory allocated
+    /// by the allocator `A`.
     pub const unsafe fn from_raw(raw: *mut T) -> Self {
         const {
             slice_type_assertions::<T>();
         }
-        Self { ptr: raw }
+        Self { ptr: raw, _allocator: PhantomData }
     }
 
     /// Return the inner raw pointer.
@@ -288,8 +294,10 @@ impl<T> CSlicePtr<T> {
         // elements of type `T`, properly aligned, and unaliased for `'a`.
         unsafe { core::slice::from_raw_parts_mut(self.ptr, slice_len) }
     }
+}
 
-    /// Create a mutable vector handle with the given element length.
+impl<T, A: Allocator + PartialEq> CSlicePtr<T, A> {
+    /// Create a mutable vector handle with the given element length and custom [`Allocator`].
     ///
     /// This is the primary way to construct a [`CVecRefMut`]. The lifetime
     /// `'_` is tied to the exclusive borrow of `&mut self`, preventing aliasing
@@ -297,16 +305,19 @@ impl<T> CSlicePtr<T> {
     ///
     /// # Safety
     ///
-    /// - `len` reflects the exact number of initialized elements pointed to by `self.ptr`
-    ///   (or `<= 0` if empty).
+    /// The caller must ensure that:
+    /// - `len` reflects the exact number of initialized elements pointed to by `self.ptr` (or `<= 0` if empty).
+    /// - The instance of `A` passed to this function MUST BE the same instance that was used for
+    ///   allocation of `self`.
     ///
     /// # Panics
     ///
     /// Panics if `len` exceeds the maximum safe slice length.
-    pub unsafe fn with_len_vec_mut<'a, L: CSliceLen>(
+    pub unsafe fn with_len_vec_mut_in<'a, L: CSliceLen>(
         &'a mut self,
         len: &'a mut L,
-    ) -> CVecRefMut<'a, T, L> {
+        alloc: A,
+    ) -> CVecRefMut<'a, T, L, A> {
         let slice_len: usize = (*len).try_into().unwrap_or(0);
         assert!(
             slice_len <= max_slice_len::<T>(),
@@ -316,103 +327,146 @@ impl<T> CSlicePtr<T> {
         // validity to deallocate/reallocate, and absence of aliases.
         // `&mut self` ties the lifetime of the returned `CVecRefMut` to the exclusive borrow,
         // preventing aliasing through `self`.
-        CVecRefMut { ptr: self, len }
+        CVecRefMut { ptr: self, len, alloc }
     }
 
-    /// Clone the contents of a Rust slice into a new C-allocated buffer.
+    /// Clone the contents of a Rust slice into a new C-allocated buffer using a custom [`Allocator`].
     ///
-    /// This function allocates a new buffer using `malloc`, clones each element
+    /// This function allocates a new buffer using `alloc`, clones each element
     /// from `src` into it, and returns a [`CSlicePtr`] to the buffer.
     /// If successful, the caller assumes ownership of the returned pointer and is
-    /// responsible for freeing it via `free` and dropping its elements.
+    /// responsible for freeing it via `alloc` and dropping its elements.
     /// If not null, the returned pointer points to `src.len()` cloned elements.
     ///
     /// Returns `Ok(CSlicePtr::null())` for empty slices and `Err(AllocError)` on
     /// allocation failure.
-    pub fn try_clone_and_leak(src: &[T]) -> Result<CSlicePtr<T>, AllocError>
+    pub fn try_clone_and_leak_in(src: &[T], alloc: A) -> Result<CSlicePtr<T, A>, AllocError>
     where
         T: Clone,
     {
         if src.is_empty() {
             return Ok(CSlicePtr::null());
         }
-        let size = core::mem::size_of_val(src);
-        // SAFETY: `size` is non-zero because the slice is non-empty, `T` is not a ZST,
-        // and there was no overflow in the size calculation.
-        let dst = unsafe { libc::malloc(size) } as *mut T;
-        if dst.is_null() {
-            return Err(AllocError);
-        }
-        // On most platforms we can assume alignment (see `slice_type_assertions`), but not all.
-        #[cfg(not(any(
-            target_os = "linux",
-            target_os = "macos",
-            target_os = "windows",
-            target_os = "android",
-            target_os = "ios"
-        )))]
-        if !dst.is_aligned() {
-            // SAFETY: `dst` was allocated via `libc::malloc`.
-            unsafe { libc::free(dst as *mut libc::c_void) };
-            return Err(AllocError);
-        }
-
-        struct FreeGuard(*mut libc::c_void);
-        impl Drop for FreeGuard {
-            fn drop(&mut self) {
-                // SAFETY: `self.0` was allocated via `libc::malloc`.
-                unsafe { libc::free(self.0) };
-            }
-        }
+        let layout = Layout::for_value(src);
+        let slice = alloc.allocate(layout)?;
+        let dst = slice.as_ptr() as *mut T;
 
         /// Drop guard that cleans up allocated memory and drops initialized elements
         /// if element cloning panics.
         ///
         /// # Safety invariant:
-        /// - `ptr` was allocated via `libc::malloc` and is properly aligned for `T`.
+        /// - `ptr` was allocated via `alloc::allocate` and is properly aligned for `T`.
         /// - The first `initialized` elements at `ptr` are valid instances of `T`.
-        struct CloneDropGuard<T> {
-            ptr: *mut T,
+        struct CloneDropGuard<'g, T, A: Allocator> {
+            alloc: &'g A,
+            ptr: NonNull<u8>,
+            layout: Layout,
             initialized: usize,
+            _marker: PhantomData<T>,
         }
 
-        impl<T> Drop for CloneDropGuard<T> {
+        impl<'g, T, A: Allocator> Drop for CloneDropGuard<'g, T, A> {
             fn drop(&mut self) {
-                // Ensure memory is freed even if dropping elements panics.
-                let _free_guard = FreeGuard(self.ptr as *mut libc::c_void);
                 if self.initialized > 0 {
-                    let slice = ptr::slice_from_raw_parts_mut(self.ptr, self.initialized);
+                    let slice = ptr::slice_from_raw_parts_mut(
+                        self.ptr.as_ptr() as *mut T,
+                        self.initialized,
+                    );
                     // SAFETY: By the safety invariants of `CloneDropGuard`, `self.ptr` is aligned for
                     // `T` and the first `self.initialized` elements are valid, fully initialized
                     // instances of `T` that can be safely dropped in place.
                     unsafe { ptr::drop_in_place(slice) };
                 }
+                // SAFETY: By the safety invariants of `CloneDropGuard`, `self.ptr` was allocated via
+                // `self.alloc` with `self.layout`.
+                unsafe { self.alloc.deallocate(self.ptr, self.layout) };
             }
         }
-        let mut guard = CloneDropGuard { ptr: dst, initialized: 0 };
 
-        // Clone each element directly into the C-allocated buffer.
+        let non_null = NonNull::new(dst as *mut u8).unwrap();
+        // Safety note: `non_null` was allocated with `alloc` using `layout` (aligned for `T`),
+        // and 0 elements are initialized, trivially satisfying the safety invariants.
+        let mut guard = CloneDropGuard {
+            alloc: &alloc,
+            ptr: non_null,
+            layout,
+            initialized: 0,
+            _marker: PhantomData::<T>,
+        };
+
+        // Clone each element directly into the allocated buffer.
         for (i, item) in src.iter().enumerate() {
             // SAFETY: `dst.add(i)` is within the allocated region and not yet
             // initialised, so `ptr::write` is the correct way to place a value.
             // Alignment is guaranteed by `CSlicePtr`'s safety invariant.
             unsafe { ptr::write(dst.add(i), item.clone()) };
+            // There is now one more initialized element, so increment.
             guard.initialized += 1;
         }
 
         // Success: disarm the guard so the buffer is leaked to the caller as intended.
         core::mem::forget(guard);
 
-        // SAFETY: `dst` was just allocated via `malloc` and fully initialised.
+        // SAFETY: `dst` was just allocated via `alloc` and all `src.len()` elements were fully
+        // initialised.
         Ok(unsafe { CSlicePtr::from_raw(dst) })
     }
 
+    /// Clone the contents of a Rust slice into a leaked [`CSlicePtr`] using a custom [`Allocator`].
+    /// Returns null for empty slices.
+    ///
+    /// # Panics
+    /// Panics if allocation fails.
+    pub fn clone_and_leak_in(src: &[T], alloc: A) -> CSlicePtr<T, A>
+    where
+        T: Clone,
+    {
+        Self::try_clone_and_leak_in(src, alloc).expect("CSlicePtr: allocation failed")
+    }
+}
+
+impl<T> CSlicePtr<T, LibcAlloc> {
+    /// Create a mutable vector handle with the given element length and custom [`Allocator`].
+    ///
+    /// This is the primary way to construct a [`CVecRefMut`]. The lifetime
+    /// `'_` is tied to the exclusive borrow of `&mut self`, preventing aliasing
+    /// while the returned handle exists.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that:
+    /// - `len` reflects the exact number of initialized elements pointed to by `self.ptr` (or `<= 0` if empty).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `len` exceeds the maximum safe slice length.
+    pub unsafe fn with_len_vec_mut<'a, L: CSliceLen>(
+        &'a mut self,
+        len: &'a mut L,
+    ) -> CVecRefMut<'a, T, L, LibcAlloc> {
+        // SAFETY: The caller guarantees `len` is the exact length and no active aliases exist.
+        // Compatibility with `LibcAlloc` is an invariant of `CSlicePtr<T, LibcAlloc>` and the
+        // fact that all instances of LibcAlloc are equivalent.
+        unsafe { self.with_len_vec_mut_in(len, LibcAlloc) }
+    }
+
+    /// Clone the contents of a Rust slice into a new C-allocated buffer using [`LibcAlloc`].
+    ///
+    /// Returns `Ok(CSlicePtr::null())` for empty slices and `Err(AllocError)` on
+    /// allocation failure.
+    pub fn try_clone_and_leak(src: &[T]) -> Result<CSlicePtr<T, LibcAlloc>, AllocError>
+    where
+        T: Clone,
+    {
+        Self::try_clone_and_leak_in(src, LibcAlloc)
+    }
+
     /// Clone the contents of a Rust slice into a leaked [`CSlicePtr`] suitable
-    /// for storage in a C struct using. Returns null for empty slices.
+    /// for storage in a C struct. Returns null for empty slices.
     ///
     /// # Panics
     /// Panics if `malloc` returns null (out of memory).
-    pub fn clone_and_leak(src: &[T]) -> CSlicePtr<T>
+    pub fn clone_and_leak(src: &[T]) -> CSlicePtr<T, LibcAlloc>
     where
         T: Clone,
     {
@@ -421,9 +475,9 @@ impl<T> CSlicePtr<T> {
 }
 
 // SAFETY: `CSlicePtr` is an owning pointer, so it is `Send` if `T` is `Send`.
-unsafe impl<T: Send> Send for CSlicePtr<T> {}
+unsafe impl<T: Send, A> Send for CSlicePtr<T, A> {}
 
-impl<T> core::fmt::Debug for CSlicePtr<T> {
+impl<T, A> core::fmt::Debug for CSlicePtr<T, A> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_tuple("CSlicePtr").field(&self.ptr).finish()
     }
@@ -433,27 +487,10 @@ impl<T> core::fmt::Debug for CSlicePtr<T> {
 mod tests {
     #![allow(clippy::undocumented_unsafe_blocks)]
     use super::*;
+    use crate::testing::*;
     use core::sync::atomic::{AtomicUsize, Ordering};
     use googletest::prelude::*;
     use std::ffi::c_int;
-
-    // Helper to create a malloc-backed buffer with the given values.
-    // Returns (ptr, len) suitable for CSlicePtr/CSliceRefMut.
-    unsafe fn malloc_array<T, const N: usize>(values: [T; N]) -> (CSlicePtr<T>, c_int) {
-        let size = core::mem::size_of_val(&values);
-        let p = unsafe { libc::malloc(size) } as *mut T;
-        for (i, v) in values.into_iter().enumerate() {
-            unsafe { ptr::write(p.add(i), v) };
-        }
-        (unsafe { CSlicePtr::from_raw(p) }, N as c_int)
-    }
-
-    // Helper to free a malloc-backed buffer.
-    unsafe fn free_array<T>(ptr: CSlicePtr<T>) {
-        if !ptr.is_null() {
-            unsafe { libc::free(ptr.as_ptr() as *mut libc::c_void) };
-        }
-    }
 
     // -----------------------------------------------------------------------
     //  CSlicePtr tests
@@ -525,6 +562,26 @@ mod tests {
     }
 
     #[gtest]
+    fn try_clone_and_leak_in_custom_allocator() {
+        let alloc = TrackingAlloc::default();
+        let src = [10, 20, 30];
+        let cloned = CSlicePtr::try_clone_and_leak_in(&src, &alloc).unwrap();
+        assert!(!cloned.is_null());
+        assert_that!(alloc.alloc_count.load(Ordering::SeqCst), eq(1));
+
+        // SAFETY: `cloned` has 3 elements.
+        let cloned_slice = unsafe { core::slice::from_raw_parts(cloned.as_ptr(), 3) };
+        assert_that!(cloned_slice, container_eq([10, 20, 30]));
+
+        let mut count: c_int = 3;
+        let mut ptr = cloned;
+        // SAFETY: `ptr` was allocated via `alloc` with `count` elements.
+        let mut handle = unsafe { ptr.with_len_vec_mut_in(&mut count, &alloc) };
+        handle.clear();
+        assert_that!(alloc.dealloc_count.load(Ordering::SeqCst), eq(1));
+    }
+
+    #[gtest]
     fn try_clone_and_leak_panic_safety() {
         static DROPPED: AtomicUsize = AtomicUsize::new(0);
 
@@ -544,12 +601,16 @@ mod tests {
             }
         }
 
+        let alloc = TrackingAlloc::default();
         let src = [PanickingClone(0), PanickingClone(1), PanickingClone(2)];
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = CSlicePtr::try_clone_and_leak(&src);
+            let _ = CSlicePtr::try_clone_and_leak_in(&src, &alloc);
         }));
         assert!(result.is_err());
+        // Cloned elements 0 and 1 must be dropped, and the buffer must be deallocated.
+        assert_that!(alloc.alloc_count.load(Ordering::SeqCst), eq(1));
+        assert_that!(alloc.dealloc_count.load(Ordering::SeqCst), eq(1));
         assert_that!(DROPPED.load(Ordering::SeqCst), eq(2));
     }
 
@@ -616,21 +677,6 @@ mod tests {
     //  Generic Len tests (usize, u32, u8, i8, isize, u64)
     // -----------------------------------------------------------------------
 
-    fn malloc_array_typed<T, L: CSliceLen, const N: usize>(
-        values: [T; N],
-    ) -> Result<(CSlicePtr<T>, L), AllocError> {
-        let size = core::mem::size_of_val(&values);
-        let p = unsafe { libc::malloc(size) } as *mut T;
-        if p.is_null() {
-            return Err(AllocError);
-        }
-        for (i, v) in values.into_iter().enumerate() {
-            unsafe { ptr::write(p.add(i), v) };
-        }
-        let len = L::try_from(N).ok().expect("valid len");
-        Ok((unsafe { CSlicePtr::from_raw(p) }, len))
-    }
-
     #[gtest]
     fn cslice_with_len_usize() {
         let result = malloc_array_typed::<i32, usize, 3>([10, 20, 30]);
@@ -660,5 +706,32 @@ mod tests {
 
         let s_i64 = unsafe { ptr.with_len(-1000i64) };
         assert!(s_i64.is_empty());
+    }
+
+    #[gtest]
+    fn c_slice_ptr_layout() {
+        // CSlicePtr must have the exact same size and alignment as a raw pointer regardless of A.
+        assert_eq!(core::mem::size_of::<CSlicePtr<i32>>(), core::mem::size_of::<*mut i32>());
+        assert_eq!(core::mem::align_of::<CSlicePtr<i32>>(), core::mem::align_of::<*mut i32>());
+        assert_eq!(
+            core::mem::size_of::<CSlicePtr<i32, TrackingAlloc>>(),
+            core::mem::size_of::<*mut i32>()
+        );
+        assert_eq!(
+            core::mem::align_of::<CSlicePtr<i32, TrackingAlloc>>(),
+            core::mem::align_of::<*mut i32>()
+        );
+    }
+
+    #[gtest]
+    fn c_slice_ptr_with_len_vec_mut_libc() {
+        let mut ptr = CSlicePtr::<i32>::null();
+        let mut count: c_int = 0;
+        let mut handle = unsafe { ptr.with_len_vec_mut(&mut count) };
+        handle.push_back(123);
+        assert_that!(&*handle, container_eq([123]));
+        handle.clear();
+        assert!(ptr.is_null());
+        assert_that!(count, eq(0));
     }
 }

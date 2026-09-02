@@ -68,21 +68,29 @@ Many C structs contain `(*mut T, L)` pairs representing dynamically-sized arrays
 can be used in place of `*mut T` and provides a safe handle for access and
 manipulation.
 
-*   **`CSlicePtr<T>`**:
+*   **`CSlicePtr<T, A = LibcAlloc>`**:
 
     *   `with_len(len)` → `&[T]` — shared slice view for any `len: L` where `L:
         CSliceLen`.
-    *   `with_len_mut(&mut len)` → `CVecRefMut<'_, T, L>` — mutable handle for
-        any `L: CSliceLen`.
+    *   `with_len_mut(len)` → `&mut [T]` — mutable slice view for any `len: L`
+        where `L: CSliceLen` and `A = LibcAlloc`.
+    *   `with_len_vec_mut(&mut len)` → `CVecRefMut<'_, T, L, A>` — mutable
+        vector handle for any `L: CSliceLen` (when `A: Default`).
+    *   `with_len_vec_mut_in(&mut len, alloc)` → `CVecRefMut<'_, T, L, A>` —
+        mutable vector handle with custom allocator instance.
     *   `clone_and_leak(&[T])` → `CSlicePtr<T>` — create a new CSlicePtr by
-        cloning an existing slice.
+        cloning an existing slice using `LibcAlloc`.
+    *   `clone_and_leak_in(&[T], alloc)` → `CSlicePtr<T, A>` — create a new
+        CSlicePtr by cloning an existing slice using a custom allocator.
 
-*   **`CVecRefMut<'a, T, L>`**: A borrowed mutable "vec-like" struct. Implements
-    `DerefMut` to `&mut [T]`. Additional methods:
+*   **`CVecRefMut<'a, T, L, A = LibcAlloc>`**: A borrowed mutable "vec-like"
+    struct. Implements `DerefMut` to `&mut [T]`. Additional methods:
 
-    *   `push_back(T)` — append via `realloc`.
-    *   `clear()` — drop all elements, free memory, reset to null/0.
-    *   `swap(&mut CVecRefMut)` — swap two handles.
+    *   `push_back(T)` / `try_push_back(T)` — append via allocator
+        (`grow`/`realloc`).
+    *   `clear()` — drop all elements, free memory via allocator, reset to
+        null/0.
+    *   `swap(&mut CVecRefMut)` — swap two handles using the same allocator.
 
 Usage example:
 
@@ -101,17 +109,17 @@ impl MyStruct {
     }
     fn items_mut(&mut self) -> &mut [Item] {
         // SAFETY: the length of `items` is `item_len`.
-        unsafe { self.items.with_len_mut(&mut self.item_len) }
+        unsafe { self.items.with_len_mut(self.item_len) }
     }
-    fn items_mut_vec(&mut self) -> CVecRefMut<'_, Item, c_int> {
+    fn items_vec_mut(&mut self) -> CVecRefMut<'_, Item, c_int> {
         // SAFETY: the length of `items` is `item_len`.
-        unsafe { self.items.with_len_mut_vec(&mut self.item_len) }
+        unsafe { self.items.with_len_vec_mut(&mut self.item_len) }
     }
 }
 
 impl Drop for MyStruct {
     fn drop(&mut self) {
-        self.items_mut().clear();
+        self.items_vec_mut().clear();
     }
 }
 ```
