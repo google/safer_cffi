@@ -107,9 +107,17 @@ unsafe impl Allocator for LibcAlloc {
     unsafe fn grow(
         &self,
         ptr: NonNull<u8>,
-        _old_layout: Layout,
+        old_layout: Layout,
         new_layout: Layout,
     ) -> Result<NonNull<[u8]>, AllocError> {
+        if new_layout.size() == 0 {
+            // SAFETY: The caller ensures `ptr` was allocated with `old_layout`.
+            unsafe { self.deallocate(ptr, old_layout) };
+            return Ok(dangling_slice(new_layout));
+        }
+        if old_layout.size() == 0 {
+            return self.allocate(new_layout);
+        }
         if new_layout.align() > MALLOC_ALIGN {
             return Err(AllocError);
         }
@@ -137,6 +145,25 @@ unsafe impl Allocator for LibcAlloc {
     }
 }
 
+/// An allocator that supports freeing memory using only the pointer, without requiring a [`Layout`].
+pub unsafe trait DropByPtrAllocator: Allocator {
+    /// Deallocates the memory referenced by `ptr`.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must denote a block of memory currently allocated via this allocator.
+    unsafe fn deallocate_by_ptr(ptr: NonNull<u8>);
+}
+
+// SAFETY: The underlying allocator (`libc::free`) supports freeing with only the pointer as an argument.
+unsafe impl DropByPtrAllocator for LibcAlloc {
+    #[inline]
+    unsafe fn deallocate_by_ptr(ptr: NonNull<u8>) {
+        // SAFETY: The caller guarantees `ptr` was allocated by this allocator.
+        unsafe { libc::free(ptr.as_ptr().cast::<core::ffi::c_void>()) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,14 +172,32 @@ mod tests {
     #[gtest]
     fn libc_alloc_zero_size() {
         let alloc = LibcAlloc;
-        let layout = Layout::from_size_align(0, 8).unwrap();
-        let res = alloc.allocate(layout);
+        let layout0 = Layout::from_size_align(0, 8).unwrap();
+        let layout16 = Layout::from_size_align(16, 8).unwrap();
+
+        let res = alloc.allocate(layout0);
         assert_that!(res, ok(anything()));
         let slice = res.unwrap();
         assert_that!(slice.len(), eq(0));
         let non_null = NonNull::new(slice.as_ptr() as *mut u8).unwrap();
-        // SAFETY: `non_null` was returned by `allocate` with `layout`.
-        unsafe { alloc.deallocate(non_null, layout) };
+
+        // Grow 0 -> 0
+        let grown0 = unsafe { alloc.grow(non_null, layout0, layout0) }.unwrap();
+        assert_that!(grown0.len(), eq(0));
+        let non_null0 = NonNull::new(grown0.as_ptr() as *mut u8).unwrap();
+
+        // Grow 0 -> 16
+        let grown16 = unsafe { alloc.grow(non_null0, layout0, layout16) }.unwrap();
+        assert_that!(grown16.len(), eq(16));
+        let non_null16 = NonNull::new(grown16.as_ptr() as *mut u8).unwrap();
+
+        // Shrink 16 -> 0
+        let shrunk0 = unsafe { alloc.shrink(non_null16, layout16, layout0) }.unwrap();
+        assert_that!(shrunk0.len(), eq(0));
+        let non_null_final = NonNull::new(shrunk0.as_ptr() as *mut u8).unwrap();
+
+        // SAFETY: `non_null_final` was returned by `shrink` with `layout0`.
+        unsafe { alloc.deallocate(non_null_final, layout0) };
     }
 
     #[gtest]

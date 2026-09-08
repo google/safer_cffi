@@ -8,8 +8,8 @@
  * except according to those terms.
  */
 
-#ifndef SAFER_CFFI_EXAMPLES_C_SLICE_PTR_C_SLICE_PTR_H_
-#define SAFER_CFFI_EXAMPLES_C_SLICE_PTR_C_SLICE_PTR_H_
+#ifndef SAFER_CFFI_EXAMPLES_C_BUF_PTR_C_BUF_PTR_H_
+#define SAFER_CFFI_EXAMPLES_C_BUF_PTR_C_BUF_PTR_H_
 
 #include <stdint.h>
 
@@ -31,4 +31,4 @@ int32_t sum_array(const IntArray* array);
 }
 #endif
 
-#endif  // SAFER_CFFI_EXAMPLES_C_SLICE_PTR_C_SLICE_PTR_H_
+#endif  // SAFER_CFFI_EXAMPLES_C_BUF_PTR_C_BUF_PTR_H_
