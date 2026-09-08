@@ -61,27 +61,27 @@ See [`examples/raw_tracker/`](examples/raw_tracker/) for a full example.
 
 ## Struct Field Helpers
 
-### C Slices — `CSlicePtr<T>`
+### C Slices — `CBufPtr<T>`
 
 Many C structs contain `(*mut T, L)` pairs representing dynamically-sized arrays
-(where `L` is an integer length type such as `c_int` or `usize`). `CSlicePtr`
-can be used in place of `*mut T` and provides a safe handle for access and
+(where `L` is an integer length type such as `c_int` or `usize`). `CBufPtr` can
+be used in place of `*mut T` and provides a safe handle for access and
 manipulation.
 
-*   **`CSlicePtr<T, A = LibcAlloc>`**:
+*   **`CBufPtr<T, A = LibcAlloc>`**:
 
     *   `with_len(len)` → `&[T]` — shared slice view for any `len: L` where `L:
-        CSliceLen`.
+        CBufLen`.
     *   `with_len_mut(len)` → `&mut [T]` — mutable slice view for any `len: L`
-        where `L: CSliceLen` and `A = LibcAlloc`.
+        where `L: CBufLen` and `A = LibcAlloc`.
     *   `with_len_vec_mut(&mut len)` → `CVecRefMut<'_, T, L, A>` — mutable
-        vector handle for any `L: CSliceLen` (when `A: Default`).
+        vector handle for any `L: CBufLen` (when `A: Default`).
     *   `with_len_vec_mut_in(&mut len, alloc)` → `CVecRefMut<'_, T, L, A>` —
         mutable vector handle with custom allocator instance.
-    *   `clone_and_leak(&[T])` → `CSlicePtr<T>` — create a new CSlicePtr by
-        cloning an existing slice using `LibcAlloc`.
-    *   `clone_and_leak_in(&[T], alloc)` → `CSlicePtr<T, A>` — create a new
-        CSlicePtr by cloning an existing slice using a custom allocator.
+    *   `clone_and_leak(&[T])` → `CBufPtr<T>` — create a new CBufPtr by cloning
+        an existing slice using `LibcAlloc`.
+    *   `clone_and_leak_in(&[T], alloc)` → `CBufPtr<T, A>` — create a new
+        CBufPtr by cloning an existing slice using a custom allocator.
 
 *   **`CVecRefMut<'a, T, L, A = LibcAlloc>`**: A borrowed mutable "vec-like"
     struct. Implements `DerefMut` to `&mut [T]`. Additional methods:
@@ -98,7 +98,7 @@ Usage example:
 #[repr(C)]
 struct MyStruct {
     // Safety invariant: the length of this array is `item_len`.
-    items: CSlicePtr<Item>,
+    items: CBufPtr<Item>,
     item_len: c_int,
 }
 

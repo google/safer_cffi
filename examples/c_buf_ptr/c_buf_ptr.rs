@@ -6,12 +6,12 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use safer_cffi::{CSlicePtr, CVecRefMut};
+use safer_cffi::{CVecRefMut, OwnedCBufPtr};
 
 #[repr(C)]
 pub struct IntArray {
     // Safety invariant: the length of this array is `item_len`.
-    pub items: CSlicePtr<i32>,
+    pub items: OwnedCBufPtr<i32>,
     pub item_len: i32,
 }
 
@@ -32,19 +32,13 @@ impl IntArray {
     }
 }
 
-impl Drop for IntArray {
-    fn drop(&mut self) {
-        self.items_vec_mut().clear();
-    }
-}
-
 // Example FFI functions.
 //
-// We focus on `CSlicePtr` here, ideally you want to manage `IntArray` with a tracker.
+// We focus on `CBufPtr` here, ideally you want to manage `IntArray` with a tracker.
 
 #[unsafe(no_mangle)]
 pub extern "C" fn create_array() -> Option<Box<IntArray>> {
-    Some(Box::new(IntArray { items: CSlicePtr::null(), item_len: 0 }))
+    Some(Box::new(IntArray { items: OwnedCBufPtr::null(), item_len: 0 }))
 }
 
 #[unsafe(no_mangle)]

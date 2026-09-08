@@ -14,7 +14,7 @@
 //! [`clear`](CVecRefMut::clear), [`replace`](CVecRefMut::replace), and [`swap`](CVecRefMut::swap).
 
 use crate::alloc::LibcAlloc;
-use crate::c_slice::{max_slice_len, CSliceLen, CSlicePtr};
+use crate::c_buf::{max_slice_len, CBufLen, CBufPtr};
 use allocator_api2::alloc::{Allocator, Layout};
 use core::ptr::{self, NonNull};
 
@@ -24,7 +24,7 @@ use core::ptr::{self, NonNull};
 
 /// A borrowed mutable handle over a `(*mut T, L)` pair representing a dynamic C vector.
 ///
-/// Created via [`CSlicePtr::with_len_vec_mut`] or [`CSlicePtr::with_len_vec_mut_in`].
+/// Created via [`CBufPtr::with_len_vec_mut`] or [`CBufPtr::with_len_vec_mut_in`].
 /// Provides mutable slice access and vector mutation operations ([`push_back`](Self::push_back),
 /// [`try_push_back`](Self::try_push_back), [`clear`](Self::clear), [`replace`](Self::replace), [`swap`](Self::swap)).
 ///
@@ -35,14 +35,14 @@ use core::ptr::{self, NonNull};
 /// # Safety Invariant
 ///
 /// If `len > 0`, it is the length of array `ptr`, and must be <= `isize::MAX`.
-/// If `len <= 0`, the array is empty.
-pub struct CVecRefMut<'a, T, L: CSliceLen, A: Allocator + PartialEq = LibcAlloc> {
-    pub(crate) ptr: &'a mut CSlicePtr<T, A>,
+/// If `len == 0`, the array is empty.
+pub struct CVecRefMut<'a, T, L: CBufLen, A: Allocator = LibcAlloc> {
+    pub(crate) ptr: &'a mut CBufPtr<T, A>,
     pub(crate) len: &'a mut L,
     pub(crate) alloc: A,
 }
 
-impl<'a, T, L: CSliceLen, A: Allocator + PartialEq> CVecRefMut<'a, T, L, A> {
+impl<'a, T, L: CBufLen, A: Allocator> CVecRefMut<'a, T, L, A> {
     /// Return the slice view with the lifetime tied to the borrow.
     #[inline]
     pub fn as_slice(&self) -> &[T] {
@@ -51,13 +51,13 @@ impl<'a, T, L: CSliceLen, A: Allocator + PartialEq> CVecRefMut<'a, T, L, A> {
             return &[];
         }
         // SAFETY:
-        // - Since `ptr` is not null, the invariants for `CSlicePtr` guarantee that `ptr` points to
+        // - Since `ptr` is not null, the invariants for `CBufPtr` guarantee that `ptr` points to
         //   an owned array of `T`s, and that the pointer is aligned for `T`.
-        // - `CSlicePtr` owns the underlying array, so the pointer is valid for
-        //   reads for the lifetime of this object (&self, created from a `CSlicePtr`).
-        // - The invariant for `CSliceRefMut` guarantees that `len` is the valid length of the array
-        //   (as per CSliceLen's safety contract) pointed to by `ptr`.
-        // - `L: CSliceLen` guarantees that `try_into()` is deterministic and pure.
+        // - `CBufPtr` owns the underlying array, so the pointer is valid for
+        //   reads for the lifetime of this object (&self, created from a `CBufPtr`).
+        // - The invariant for `CVecRefMut` guarantees that `len` is the valid length of the array
+        //   (as per CBufLen's safety contract) pointed to by `ptr`.
+        // - `L: CBufLen` guarantees that `try_into()` is deterministic and pure.
         unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), len) }
     }
 
@@ -69,13 +69,13 @@ impl<'a, T, L: CSliceLen, A: Allocator + PartialEq> CVecRefMut<'a, T, L, A> {
             return &mut [];
         }
         // SAFETY:
-        // - Since `ptr` is not null, the invariants for `CSlicePtr` guarantee that `ptr` points to
+        // - Since `ptr` is not null, the invariants for `CBufPtr` guarantee that `ptr` points to
         //   an owned array of `T`s, and that the pointer is aligned for `T`.
-        // - `CSlicePtr` owns the underlying array, so the pointer is valid for
-        //   reads for the lifetime of this object (&self, created from a `CSlicePtr`).
+        // - `CBufPtr` owns the underlying array, so the pointer is valid for
+        //   reads for the lifetime of this object (&self, created from a `CBufPtr`).
         // - The invariant for `CVecRefMut` guarantees that `len` is the valid length of the array
         //   pointed to by `ptr`.
-        // - `L: CSliceLen` guarantees that `try_into()` is deterministic and pure.
+        // - `L: CBufLen` guarantees that `try_into()` is deterministic and pure.
         unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), len) }
     }
 
@@ -140,7 +140,7 @@ impl<'a, T, L: CSliceLen, A: Allocator + PartialEq> CVecRefMut<'a, T, L, A> {
 
         // SAFETY: `new_ptr` was allocated via the configured allocator, points to an array of
         // `T` and is aligned.
-        let p = unsafe { CSlicePtr::from_raw(new_ptr) };
+        let p = unsafe { CBufPtr::from_raw(new_ptr) };
         *self.ptr = p;
         *self.len = new_len_val;
         Ok(())
@@ -157,23 +157,13 @@ impl<'a, T, L: CSliceLen, A: Allocator + PartialEq> CVecRefMut<'a, T, L, A> {
         }
     }
 
-    /// Swap the underlying pointer and len with another handle that uses the same allocator.
-    ///
-    /// # Panics
-    /// Panics if `self` and `other` do not share the same allocator instance (as determined by [`PartialEq`]).
-    pub fn swap(&mut self, other: &mut CVecRefMut<'_, T, L, A>) {
-        assert!(self.alloc == other.alloc, "CVecRefMut::swap: handles must use the same allocator");
-        core::mem::swap(self.ptr, other.ptr);
-        core::mem::swap(self.len, other.len);
-    }
-
     /// Drop all elements and deallocate the buffer using the configured [`Allocator`].
     pub fn clear(&mut self) {
         let len = (*self.len).try_into().unwrap_or(0);
         // We replace the pointer and length first to leave the handle in a valid, empty
         // state immediately. This is necessary for panic safety: if dropping elements
         // panics, the handle won't point to invalid memory.
-        let old_ptr = core::mem::replace(self.ptr, CSlicePtr::null());
+        let old_ptr = core::mem::replace(self.ptr, CBufPtr::null());
         *self.len = L::default();
 
         if !old_ptr.is_null()
@@ -208,7 +198,19 @@ impl<'a, T, L: CSliceLen, A: Allocator + PartialEq> CVecRefMut<'a, T, L, A> {
     }
 }
 
-impl<T, L: CSliceLen, A: Allocator + PartialEq> core::ops::Deref for CVecRefMut<'_, T, L, A> {
+impl<'a, T, L: CBufLen, A: Allocator + PartialEq> CVecRefMut<'a, T, L, A> {
+    /// Swap the underlying pointer and len with another handle that uses the same allocator.
+    ///
+    /// # Panics
+    /// Panics if `self` and `other` do not share the same allocator instance.
+    pub fn swap(&mut self, other: &mut CVecRefMut<'_, T, L, A>) {
+        assert!(self.alloc == other.alloc, "CVecRefMut::swap: handles must use the same allocator");
+        core::mem::swap(self.ptr, other.ptr);
+        core::mem::swap(self.len, other.len);
+    }
+}
+
+impl<T, L: CBufLen, A: Allocator> core::ops::Deref for CVecRefMut<'_, T, L, A> {
     type Target = [T];
 
     #[inline]
@@ -217,16 +219,14 @@ impl<T, L: CSliceLen, A: Allocator + PartialEq> core::ops::Deref for CVecRefMut<
     }
 }
 
-impl<T, L: CSliceLen, A: Allocator + PartialEq> core::ops::DerefMut for CVecRefMut<'_, T, L, A> {
+impl<T, L: CBufLen, A: Allocator> core::ops::DerefMut for CVecRefMut<'_, T, L, A> {
     #[inline]
     fn deref_mut(&mut self) -> &mut [T] {
         self.as_slice_mut()
     }
 }
 
-impl<T: core::fmt::Debug, L: CSliceLen, A: Allocator + PartialEq> core::fmt::Debug
-    for CVecRefMut<'_, T, L, A>
-{
+impl<T: core::fmt::Debug, L: CBufLen, A: Allocator> core::fmt::Debug for CVecRefMut<'_, T, L, A> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         core::fmt::Debug::fmt(self.as_slice(), f)
     }
@@ -244,7 +244,7 @@ mod tests {
 
     #[gtest]
     fn c_vec_ref_mut_null_ptr() {
-        let mut ptr = CSlicePtr::<i32>::null();
+        let mut ptr = CBufPtr::<i32>::null();
         let mut len: c_int = 0;
         let handle = unsafe { ptr.with_len_vec_mut(&mut len) };
         assert_that!(handle.len(), eq(0));
@@ -255,7 +255,7 @@ mod tests {
     fn c_vec_ref_mut_nonnull_ptr_zero_len() {
         // Simulate a C struct where a buffer was allocated but len is 0.
         // clear() must still free the buffer.
-        let mut ptr = unsafe { CSlicePtr::<i32>::from_raw(libc::malloc(16) as *mut i32) };
+        let mut ptr = unsafe { CBufPtr::<i32>::from_raw(libc::malloc(16) as *mut i32) };
         let mut len: c_int = 0;
         let mut handle = unsafe { ptr.with_len_vec_mut(&mut len) };
         assert_that!(handle.len(), eq(0));
@@ -269,7 +269,7 @@ mod tests {
     fn c_vec_ref_mut_nonnull_ptr_zero_len_push_back() {
         // Simulate a C struct where a buffer was allocated but len is 0.
         // push_back() must free the previous buffer and grow properly.
-        let mut ptr = unsafe { CSlicePtr::<i32>::from_raw(libc::malloc(16) as *mut i32) };
+        let mut ptr = unsafe { CBufPtr::<i32>::from_raw(libc::malloc(16) as *mut i32) };
         let mut len: c_int = 0;
         let mut handle = unsafe { ptr.with_len_vec_mut(&mut len) };
         handle.push_back(123);
@@ -302,7 +302,7 @@ mod tests {
 
     #[gtest]
     fn c_vec_ref_mut_push_back_to_empty() {
-        let mut ptr = CSlicePtr::<i32>::null();
+        let mut ptr = CBufPtr::<i32>::null();
         let mut len: c_int = 0;
         let mut handle = unsafe { ptr.with_len_vec_mut(&mut len) };
         handle.push_back(42);
@@ -329,7 +329,7 @@ mod tests {
     #[gtest]
     fn c_vec_ref_mut_custom_allocator_push_back_and_clear() {
         let alloc = TrackingAlloc::default();
-        let mut ptr = CSlicePtr::null();
+        let mut ptr = CBufPtr::null();
         let mut count: c_int = 0;
         {
             // SAFETY: Null pointer with length 0 is safe.
@@ -355,7 +355,7 @@ mod tests {
         // Allocate a dummy buffer first.
         let slice = (&alloc).allocate(Layout::new::<i32>()).unwrap();
         // SAFETY: ptr is valid and was just allocated, we don't modify it.
-        let mut ptr = unsafe { CSlicePtr::from_raw(slice.as_ptr() as *mut i32) };
+        let mut ptr = unsafe { CBufPtr::from_raw(slice.as_ptr() as *mut i32) };
         let mut count: c_int = 0;
         {
             // SAFETY: ptr is non-null, count is 0, allocated via alloc.
@@ -378,7 +378,7 @@ mod tests {
 
     #[gtest]
     fn c_vec_ref_mut_try_push_back_overflow() {
-        let mut ptr = CSlicePtr::<i32>::null();
+        let mut ptr = CBufPtr::<i32>::null();
         let mut len: c_int = c_int::MAX;
         let mut handle = unsafe { ptr.with_len_vec_mut(&mut len) };
         let result = handle.try_push_back(999);
@@ -431,9 +431,9 @@ mod tests {
         let alloc1 = TrackingAlloc::default();
         let alloc2 = TrackingAlloc::default();
 
-        let mut ptr1 = CSlicePtr::<i32, _>::null();
+        let mut ptr1 = CBufPtr::<i32, _>::null();
         let mut len1: c_int = 0;
-        let mut ptr2 = CSlicePtr::<i32, _>::null();
+        let mut ptr2 = CBufPtr::<i32, _>::null();
         let mut len2: c_int = 0;
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -448,7 +448,7 @@ mod tests {
 
     #[gtest]
     fn c_vec_ref_mut_clear_already_empty() {
-        let mut ptr = CSlicePtr::<i32>::null();
+        let mut ptr = CBufPtr::<i32>::null();
         let mut len: c_int = 0;
         let mut handle = unsafe { ptr.with_len_vec_mut(&mut len) };
         // Clearing an already-empty slice should not panic.
@@ -499,7 +499,7 @@ mod tests {
 
     #[gtest]
     fn c_vec_ref_mut_usize() {
-        let mut ptr = CSlicePtr::<i32>::null();
+        let mut ptr = CBufPtr::<i32>::null();
         let mut len: usize = 0;
         let mut handle = unsafe { ptr.with_len_vec_mut(&mut len) };
         handle.push_back(100);
@@ -513,7 +513,7 @@ mod tests {
 
     #[gtest]
     fn c_vec_ref_mut_u32() {
-        let mut ptr = CSlicePtr::<i32>::null();
+        let mut ptr = CBufPtr::<i32>::null();
         let mut len: u32 = 0;
         let mut handle = unsafe { ptr.with_len_vec_mut(&mut len) };
         handle.push_back(42);
@@ -525,7 +525,7 @@ mod tests {
 
     #[gtest]
     fn c_vec_ref_mut_u64() {
-        let mut ptr = CSlicePtr::<i32>::null();
+        let mut ptr = CBufPtr::<i32>::null();
         let mut len: u64 = 0;
         let mut handle = unsafe { ptr.with_len_vec_mut(&mut len) };
         handle.push_back(77);
@@ -537,7 +537,7 @@ mod tests {
 
     #[gtest]
     fn c_vec_ref_mut_u8_overflow() {
-        let mut ptr = CSlicePtr::<i32>::null();
+        let mut ptr = CBufPtr::<i32>::null();
         let mut len: u8 = u8::MAX;
         let mut handle = unsafe { ptr.with_len_vec_mut(&mut len) };
         let result = handle.try_push_back(999);

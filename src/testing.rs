@@ -12,25 +12,25 @@
 #![allow(clippy::undocumented_unsafe_blocks)]
 
 use crate::alloc::LibcAlloc;
-use crate::c_slice::{CSliceLen, CSlicePtr};
+use crate::c_buf::{CBufLen, CBufPtr};
 use allocator_api2::alloc::{AllocError, Allocator, Layout};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::ffi::c_int;
 
 /// Helper to create a malloc-backed buffer with the given values.
-/// Returns `(ptr, len)` suitable for `CSlicePtr`/`CVecRefMut`.
+/// Returns `(ptr, len)` suitable for `CBufPtr`/`CVecRefMut`.
 ///
 /// # Safety
 ///
 /// Caller must ensure that values can be written to malloc-allocated memory.
-pub(crate) unsafe fn malloc_array<T, const N: usize>(values: [T; N]) -> (CSlicePtr<T>, c_int) {
+pub(crate) unsafe fn malloc_array<T, const N: usize>(values: [T; N]) -> (CBufPtr<T>, c_int) {
     let size = core::mem::size_of_val(&values);
     let p = unsafe { libc::malloc(size) } as *mut T;
     for (i, v) in values.into_iter().enumerate() {
         unsafe { core::ptr::write(p.add(i), v) };
     }
-    (unsafe { CSlicePtr::from_raw(p) }, N as c_int)
+    (unsafe { CBufPtr::from_raw(p) }, N as c_int)
 }
 
 /// Helper to free a malloc-backed buffer.
@@ -38,16 +38,16 @@ pub(crate) unsafe fn malloc_array<T, const N: usize>(values: [T; N]) -> (CSliceP
 /// # Safety
 ///
 /// `ptr` must have been allocated via `libc::malloc` or be null.
-pub(crate) unsafe fn free_array<T>(ptr: CSlicePtr<T>) {
+pub(crate) unsafe fn free_array<T>(ptr: CBufPtr<T>) {
     if !ptr.is_null() {
         unsafe { libc::free(ptr.as_ptr() as *mut libc::c_void) };
     }
 }
 
 /// Helper to create a malloc-backed buffer with a typed length.
-pub(crate) fn malloc_array_typed<T, L: CSliceLen, const N: usize>(
+pub(crate) fn malloc_array_typed<T, L: CBufLen, const N: usize>(
     values: [T; N],
-) -> Result<(CSlicePtr<T>, L), AllocError> {
+) -> Result<(CBufPtr<T>, L), AllocError> {
     let size = core::mem::size_of_val(&values);
     let p = unsafe { libc::malloc(size) } as *mut T;
     if p.is_null() {
@@ -57,7 +57,7 @@ pub(crate) fn malloc_array_typed<T, L: CSliceLen, const N: usize>(
         unsafe { core::ptr::write(p.add(i), v) };
     }
     let len = L::try_from(N).ok().expect("valid len");
-    Ok((unsafe { CSlicePtr::from_raw(p) }, len))
+    Ok((unsafe { CBufPtr::from_raw(p) }, len))
 }
 
 /// Custom tracking allocator for testing generic Allocator support.
