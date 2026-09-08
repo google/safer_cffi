@@ -19,11 +19,11 @@
 //!
 //! ```
 //! use std::os::raw::c_int;
-//! use safer_cffi::{CSlicePtr, CVecRefMut};
+//! use safer_cffi::{CBufPtr, CVecRefMut};
 //!
 //! #[repr(C)]
 //! struct MyStruct {
-//!     items: CSlicePtr<f32>,    // repr(transparent) wrapper around *mut f32
+//!     items: CBufPtr<f32>,    // repr(transparent) wrapper around *mut f32
 //!     item_len: c_int,
 //! }
 //!
@@ -48,7 +48,7 @@
 //! }
 //!
 //! let mut my_struct = MyStruct {
-//!     items: CSlicePtr::null(),
+//!     items: CBufPtr::null(),
 //!     item_len: 0,
 //! };
 //!
@@ -63,7 +63,7 @@
 //! my_struct.items_vec_mut().push_back(40.0);
 //!
 //! // Clone impl:
-//! let cloned_ptr: CSlicePtr<f32> = CSlicePtr::clone_and_leak(my_struct.items());
+//! let cloned_ptr: CBufPtr<f32> = CBufPtr::clone_and_leak(my_struct.items());
 //!
 //! // Drop impl:
 //! my_struct.items_vec_mut().clear();
@@ -89,7 +89,7 @@ pub(crate) const fn max_slice_len<T>() -> usize {
     }
 }
 
-/// Static type assertions for `CSlicePtr`.
+/// Static type assertions for `CBufPtr`.
 const fn slice_type_assertions<T>() {
     // Ensure that `T` is no larger than the alignment provided by `malloc`.
     // This is a constraint because we use `malloc` to allocate the buffer, and if `T` is
@@ -129,7 +129,7 @@ const fn slice_type_assertions<T>() {
 }
 
 // ---------------------------------------------------------------------------
-//  CSliceLen — integer types suitable for C slice lengths
+//  CBufLen — integer types suitable for C slice lengths
 // ---------------------------------------------------------------------------
 
 /// An integer type that can represent the length of a C slice.
@@ -154,35 +154,35 @@ const fn slice_type_assertions<T>() {
 ///    via `TryInto<usize>` (returning `Err`), ensuring they are safely treated as length 0.
 /// 4. **No Interior Mutability**: `Self` must not use interior mutability (`Cell`, `UnsafeCell`,
 ///    `Atomic*`, etc.) to change its conversion output over time.
-pub unsafe trait CSliceLen:
+pub unsafe trait CBufLen:
     Copy + TryInto<usize> + TryFrom<usize> + Default + 'static
 {
 }
 
 // SAFETY: Primitive unsigned integer types satisfy purity, determinism,
 // and round-trip conversion to/from `usize` within their representable ranges.
-unsafe impl CSliceLen for usize {}
-unsafe impl CSliceLen for u8 {}
-unsafe impl CSliceLen for u16 {}
-unsafe impl CSliceLen for u32 {}
-unsafe impl CSliceLen for u64 {}
+unsafe impl CBufLen for usize {}
+unsafe impl CBufLen for u8 {}
+unsafe impl CBufLen for u16 {}
+unsafe impl CBufLen for u32 {}
+unsafe impl CBufLen for u64 {}
 
 // SAFETY: Primitive signed integer types satisfy purity, determinism,
 // and correctly fail conversion via `TryInto<usize>` on negative values.
-unsafe impl CSliceLen for isize {}
-unsafe impl CSliceLen for i8 {}
-unsafe impl CSliceLen for i16 {}
-unsafe impl CSliceLen for i32 {}
-unsafe impl CSliceLen for i64 {}
+unsafe impl CBufLen for isize {}
+unsafe impl CBufLen for i8 {}
+unsafe impl CBufLen for i16 {}
+unsafe impl CBufLen for i32 {}
+unsafe impl CBufLen for i64 {}
 
 // ---------------------------------------------------------------------------
-//  CSlicePtr — repr(transparent) wrapper around *mut T
+//  CBufPtr — repr(transparent) wrapper around *mut T
 // ---------------------------------------------------------------------------
 
 /// A `#[repr(transparent)]` wrapper around `*mut T` for use in `#[repr(C)]`
 /// structs.
 ///
-/// `CSlicePtr` provides [`with_len`](Self::with_len) to get a `&[T]` slice,
+/// `CBufPtr` provides [`with_len`](Self::with_len) to get a `&[T]` slice,
 /// [`with_len_mut`](Self::with_len_mut) to get a `&mut [T]` slice,
 /// [`with_len_vec_mut`](Self::with_len_vec_mut) to create a [`CVecRefMut`] handle,
 /// and [`clone_and_leak`](Self::clone_and_leak) to clone a Rust slice into a
@@ -204,27 +204,27 @@ unsafe impl CSliceLen for i64 {}
 /// - `T` is not a zero-sized type, i.e. `size_of::<T>() > 0`.
 /// - `T` is not over-aligned for a standard `malloc` call.
 #[repr(transparent)]
-pub struct CSlicePtr<T, A = LibcAlloc> {
+pub struct CBufPtr<T, A = LibcAlloc> {
     ptr: *mut T,
     _allocator: PhantomData<A>,
 }
 
-impl<T, A: Allocator> CSlicePtr<T, A> {
-    /// Create a null `CSlicePtr`.
+impl<T, A: Allocator> CBufPtr<T, A> {
+    /// Create a null `CBufPtr`.
     pub const fn null() -> Self {
         const {
             slice_type_assertions::<T>();
         }
-        // SAFETY: null pointers trivially satisfy all other safety invariants of CSlicePtr.
+        // SAFETY: null pointers trivially satisfy all other safety invariants of CBufPtr.
         Self { ptr: ptr::null_mut(), _allocator: PhantomData }
     }
 
-    /// Construct a `CSlicePtr` from a raw pointer.
+    /// Construct a `CBufPtr` from a raw pointer.
     ///
     /// # Safety
     ///
     /// The caller must ensure that `raw` satisfies all the safety invariants of
-    /// [`CSlicePtr`], including that if non-null, it points to memory allocated
+    /// [`CBufPtr`], including that if non-null, it points to memory allocated
     /// by the allocator `A`.
     pub const unsafe fn from_raw(raw: *mut T) -> Self {
         const {
@@ -256,12 +256,12 @@ impl<T, A: Allocator> CSlicePtr<T, A> {
     /// # Panics
     ///
     /// Panics if `len` exceeds the maximum safe slice length.
-    pub unsafe fn with_len<L: CSliceLen>(&self, len: L) -> &[T] {
+    pub unsafe fn with_len<L: CBufLen>(&self, len: L) -> &[T] {
         let len: usize = len.try_into().unwrap_or(0);
         if self.ptr.is_null() || len == 0 {
             return &[];
         }
-        assert!(len <= max_slice_len::<T>(), "CSlicePtr: len exceeds maximum safe slice length");
+        assert!(len <= max_slice_len::<T>(), "CBufPtr: len exceeds maximum safe slice length");
         // SAFETY: The caller guarantees that `self.ptr` points to at least `len` initialised
         // elements of type `T`. `&self` ties the lifetime of the returned slice to the borrow.
         unsafe { core::slice::from_raw_parts(self.ptr, len) }
@@ -281,11 +281,11 @@ impl<T, A: Allocator> CSlicePtr<T, A> {
     /// # Panics
     ///
     /// Panics if `len` exceeds the maximum safe slice length.
-    pub unsafe fn with_len_mut<L: CSliceLen>(&mut self, len: L) -> &mut [T] {
+    pub unsafe fn with_len_mut<L: CBufLen>(&mut self, len: L) -> &mut [T] {
         let slice_len: usize = len.try_into().unwrap_or(0);
         assert!(
             slice_len <= max_slice_len::<T>(),
-            "CSlicePtr: len exceeds maximum safe slice length"
+            "CBufPtr: len exceeds maximum safe slice length"
         );
         if self.ptr.is_null() || slice_len == 0 {
             return &mut [];
@@ -296,7 +296,7 @@ impl<T, A: Allocator> CSlicePtr<T, A> {
     }
 }
 
-impl<T, A: Allocator + PartialEq> CSlicePtr<T, A> {
+impl<T, A: Allocator + PartialEq> CBufPtr<T, A> {
     /// Create a mutable vector handle with the given element length and custom [`Allocator`].
     ///
     /// This is the primary way to construct a [`CVecRefMut`]. The lifetime
@@ -313,7 +313,7 @@ impl<T, A: Allocator + PartialEq> CSlicePtr<T, A> {
     /// # Panics
     ///
     /// Panics if `len` exceeds the maximum safe slice length.
-    pub unsafe fn with_len_vec_mut_in<'a, L: CSliceLen>(
+    pub unsafe fn with_len_vec_mut_in<'a, L: CBufLen>(
         &'a mut self,
         len: &'a mut L,
         alloc: A,
@@ -321,7 +321,7 @@ impl<T, A: Allocator + PartialEq> CSlicePtr<T, A> {
         let slice_len: usize = (*len).try_into().unwrap_or(0);
         assert!(
             slice_len <= max_slice_len::<T>(),
-            "CSlicePtr: len exceeds maximum safe slice length"
+            "CBufPtr: len exceeds maximum safe slice length"
         );
         // SAFETY: The caller guarantees the pointer/len invariant, allocator compatibility,
         // validity to deallocate/reallocate, and absence of aliases.
@@ -333,19 +333,19 @@ impl<T, A: Allocator + PartialEq> CSlicePtr<T, A> {
     /// Clone the contents of a Rust slice into a new C-allocated buffer using a custom [`Allocator`].
     ///
     /// This function allocates a new buffer using `alloc`, clones each element
-    /// from `src` into it, and returns a [`CSlicePtr`] to the buffer.
+    /// from `src` into it, and returns a [`CBufPtr`] to the buffer.
     /// If successful, the caller assumes ownership of the returned pointer and is
     /// responsible for freeing it via `alloc` and dropping its elements.
     /// If not null, the returned pointer points to `src.len()` cloned elements.
     ///
-    /// Returns `Ok(CSlicePtr::null())` for empty slices and `Err(AllocError)` on
+    /// Returns `Ok(CBufPtr::null())` for empty slices and `Err(AllocError)` on
     /// allocation failure.
-    pub fn try_clone_and_leak_in(src: &[T], alloc: A) -> Result<CSlicePtr<T, A>, AllocError>
+    pub fn try_clone_and_leak_in(src: &[T], alloc: A) -> Result<CBufPtr<T, A>, AllocError>
     where
         T: Clone,
     {
         if src.is_empty() {
-            return Ok(CSlicePtr::null());
+            return Ok(CBufPtr::null());
         }
         let layout = Layout::for_value(src);
         let slice = alloc.allocate(layout)?;
@@ -398,7 +398,7 @@ impl<T, A: Allocator + PartialEq> CSlicePtr<T, A> {
         for (i, item) in src.iter().enumerate() {
             // SAFETY: `dst.add(i)` is within the allocated region and not yet
             // initialised, so `ptr::write` is the correct way to place a value.
-            // Alignment is guaranteed by `CSlicePtr`'s safety invariant.
+            // Alignment is guaranteed by `CBufPtr`'s safety invariant.
             unsafe { ptr::write(dst.add(i), item.clone()) };
             // There is now one more initialized element, so increment.
             guard.initialized += 1;
@@ -409,23 +409,23 @@ impl<T, A: Allocator + PartialEq> CSlicePtr<T, A> {
 
         // SAFETY: `dst` was just allocated via `alloc` and all `src.len()` elements were fully
         // initialised.
-        Ok(unsafe { CSlicePtr::from_raw(dst) })
+        Ok(unsafe { CBufPtr::from_raw(dst) })
     }
 
-    /// Clone the contents of a Rust slice into a leaked [`CSlicePtr`] using a custom [`Allocator`].
+    /// Clone the contents of a Rust slice into a leaked [`CBufPtr`] using a custom [`Allocator`].
     /// Returns null for empty slices.
     ///
     /// # Panics
     /// Panics if allocation fails.
-    pub fn clone_and_leak_in(src: &[T], alloc: A) -> CSlicePtr<T, A>
+    pub fn clone_and_leak_in(src: &[T], alloc: A) -> CBufPtr<T, A>
     where
         T: Clone,
     {
-        Self::try_clone_and_leak_in(src, alloc).expect("CSlicePtr: allocation failed")
+        Self::try_clone_and_leak_in(src, alloc).expect("CBufPtr: allocation failed")
     }
 }
 
-impl<T> CSlicePtr<T, LibcAlloc> {
+impl<T> CBufPtr<T, LibcAlloc> {
     /// Create a mutable vector handle with the given element length and custom [`Allocator`].
     ///
     /// This is the primary way to construct a [`CVecRefMut`]. The lifetime
@@ -440,46 +440,46 @@ impl<T> CSlicePtr<T, LibcAlloc> {
     /// # Panics
     ///
     /// Panics if `len` exceeds the maximum safe slice length.
-    pub unsafe fn with_len_vec_mut<'a, L: CSliceLen>(
+    pub unsafe fn with_len_vec_mut<'a, L: CBufLen>(
         &'a mut self,
         len: &'a mut L,
     ) -> CVecRefMut<'a, T, L, LibcAlloc> {
         // SAFETY: The caller guarantees `len` is the exact length and no active aliases exist.
-        // Compatibility with `LibcAlloc` is an invariant of `CSlicePtr<T, LibcAlloc>` and the
+        // Compatibility with `LibcAlloc` is an invariant of `CBufPtr<T, LibcAlloc>` and the
         // fact that all instances of LibcAlloc are equivalent.
         unsafe { self.with_len_vec_mut_in(len, LibcAlloc) }
     }
 
     /// Clone the contents of a Rust slice into a new C-allocated buffer using [`LibcAlloc`].
     ///
-    /// Returns `Ok(CSlicePtr::null())` for empty slices and `Err(AllocError)` on
+    /// Returns `Ok(CBufPtr::null())` for empty slices and `Err(AllocError)` on
     /// allocation failure.
-    pub fn try_clone_and_leak(src: &[T]) -> Result<CSlicePtr<T, LibcAlloc>, AllocError>
+    pub fn try_clone_and_leak(src: &[T]) -> Result<CBufPtr<T, LibcAlloc>, AllocError>
     where
         T: Clone,
     {
         Self::try_clone_and_leak_in(src, LibcAlloc)
     }
 
-    /// Clone the contents of a Rust slice into a leaked [`CSlicePtr`] suitable
+    /// Clone the contents of a Rust slice into a leaked [`CBufPtr`] suitable
     /// for storage in a C struct. Returns null for empty slices.
     ///
     /// # Panics
     /// Panics if `malloc` returns null (out of memory).
-    pub fn clone_and_leak(src: &[T]) -> CSlicePtr<T, LibcAlloc>
+    pub fn clone_and_leak(src: &[T]) -> CBufPtr<T, LibcAlloc>
     where
         T: Clone,
     {
-        Self::try_clone_and_leak(src).expect("CSlicePtr: allocation failed")
+        Self::try_clone_and_leak(src).expect("CBufPtr: allocation failed")
     }
 }
 
-// SAFETY: `CSlicePtr` is an owning pointer, so it is `Send` if `T` is `Send`.
-unsafe impl<T: Send, A> Send for CSlicePtr<T, A> {}
+// SAFETY: `CBufPtr` is an owning pointer, so it is `Send` if `T` is `Send`.
+unsafe impl<T: Send, A> Send for CBufPtr<T, A> {}
 
-impl<T, A> core::fmt::Debug for CSlicePtr<T, A> {
+impl<T, A> core::fmt::Debug for CBufPtr<T, A> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_tuple("CSlicePtr").field(&self.ptr).finish()
+        f.debug_tuple("CBufPtr").field(&self.ptr).finish()
     }
 }
 
@@ -493,12 +493,12 @@ mod tests {
     use std::ffi::c_int;
 
     // -----------------------------------------------------------------------
-    //  CSlicePtr tests
+    //  CBufPtr tests
     // -----------------------------------------------------------------------
 
     #[gtest]
     fn with_len_null_ptr() {
-        let ptr = CSlicePtr::<i32>::null();
+        let ptr = CBufPtr::<i32>::null();
         let s = unsafe { ptr.with_len(0) };
         assert_that!(s.len(), eq(0));
         assert!(s.is_empty());
@@ -508,7 +508,7 @@ mod tests {
     fn with_len_nonnull_ptr_zero_len() {
         // Simulate a C struct where a buffer was allocated but len is 0.
         let raw_ptr = unsafe { libc::malloc(16) } as *mut i32;
-        let ptr = unsafe { CSlicePtr::from_raw(raw_ptr) };
+        let ptr = unsafe { CBufPtr::from_raw(raw_ptr) };
         let s = unsafe { ptr.with_len(0) };
         assert_that!(s.len(), eq(0));
         assert!(s.is_empty());
@@ -517,7 +517,7 @@ mod tests {
 
     #[gtest]
     fn with_len_negative_len() {
-        let ptr = CSlicePtr::<i32>::null();
+        let ptr = CBufPtr::<i32>::null();
         let s = unsafe { ptr.with_len(-5) };
         assert_that!(s.len(), eq(0));
     }
@@ -543,7 +543,7 @@ mod tests {
 
     #[gtest]
     fn try_clone_and_leak_empty() {
-        let result = CSlicePtr::<i32>::try_clone_and_leak(&[]);
+        let result = CBufPtr::<i32>::try_clone_and_leak(&[]);
         assert_that!(result, ok(anything()));
         assert!(result.unwrap().is_null());
     }
@@ -551,7 +551,7 @@ mod tests {
     #[gtest]
     fn try_clone_and_leak_nonempty() {
         let src = [100, 200, 300];
-        let cloned = CSlicePtr::try_clone_and_leak(&src).unwrap();
+        let cloned = CBufPtr::try_clone_and_leak(&src).unwrap();
         assert!(!cloned.is_null());
         // Verify cloned data is independent.
         let cloned_slice = unsafe { core::slice::from_raw_parts(cloned.as_ptr(), 3) };
@@ -565,7 +565,7 @@ mod tests {
     fn try_clone_and_leak_in_custom_allocator() {
         let alloc = TrackingAlloc::default();
         let src = [10, 20, 30];
-        let cloned = CSlicePtr::try_clone_and_leak_in(&src, &alloc).unwrap();
+        let cloned = CBufPtr::try_clone_and_leak_in(&src, &alloc).unwrap();
         assert!(!cloned.is_null());
         assert_that!(alloc.alloc_count.load(Ordering::SeqCst), eq(1));
 
@@ -605,7 +605,7 @@ mod tests {
         let src = [PanickingClone(0), PanickingClone(1), PanickingClone(2)];
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = CSlicePtr::try_clone_and_leak_in(&src, &alloc);
+            let _ = CBufPtr::try_clone_and_leak_in(&src, &alloc);
         }));
         assert!(result.is_err());
         // Cloned elements 0 and 1 must be dropped, and the buffer must be deallocated.
@@ -620,7 +620,7 @@ mod tests {
 
     #[gtest]
     fn cslice_with_len_mut_null_ptr() {
-        let mut ptr = CSlicePtr::<i32>::null();
+        let mut ptr = CBufPtr::<i32>::null();
         let slice = unsafe { ptr.with_len_mut(0) };
         assert_that!(slice.len(), eq(0));
         assert!(slice.is_empty());
@@ -628,7 +628,7 @@ mod tests {
 
     #[gtest]
     fn cslice_with_len_mut_nonnull_ptr_zero_len() {
-        let mut ptr = unsafe { CSlicePtr::from_raw(libc::malloc(16) as *mut i32) };
+        let mut ptr = unsafe { CBufPtr::from_raw(libc::malloc(16) as *mut i32) };
         let slice = unsafe { ptr.with_len_mut(0) };
         assert_that!(slice.len(), eq(0));
         assert!(slice.is_empty());
@@ -667,7 +667,7 @@ mod tests {
 
     #[gtest]
     fn cslice_with_len_mut_into_iterator_empty() {
-        let mut ptr = CSlicePtr::<i32>::null();
+        let mut ptr = CBufPtr::<i32>::null();
         let slice = unsafe { ptr.with_len_mut(0) };
         let collected: Vec<&mut i32> = slice.iter_mut().collect();
         assert_that!(collected.len(), eq(0));
@@ -687,14 +687,14 @@ mod tests {
         assert_that!(s.len(), eq(3));
         unsafe { free_array(ptr) };
 
-        let null_ptr = CSlicePtr::<i32>::null();
+        let null_ptr = CBufPtr::<i32>::null();
         let empty = unsafe { null_ptr.with_len(0usize) };
         assert!(empty.is_empty());
     }
 
     #[gtest]
     fn cslice_with_len_signed_negative() {
-        let ptr = CSlicePtr::<i32>::null();
+        let ptr = CBufPtr::<i32>::null();
         let s_i8 = unsafe { ptr.with_len(-1i8) };
         assert!(s_i8.is_empty());
 
@@ -709,23 +709,23 @@ mod tests {
     }
 
     #[gtest]
-    fn c_slice_ptr_layout() {
-        // CSlicePtr must have the exact same size and alignment as a raw pointer regardless of A.
-        assert_eq!(core::mem::size_of::<CSlicePtr<i32>>(), core::mem::size_of::<*mut i32>());
-        assert_eq!(core::mem::align_of::<CSlicePtr<i32>>(), core::mem::align_of::<*mut i32>());
+    fn c_buf_ptr_layout() {
+        // CBufPtr must have the exact same size and alignment as a raw pointer regardless of A.
+        assert_eq!(core::mem::size_of::<CBufPtr<i32>>(), core::mem::size_of::<*mut i32>());
+        assert_eq!(core::mem::align_of::<CBufPtr<i32>>(), core::mem::align_of::<*mut i32>());
         assert_eq!(
-            core::mem::size_of::<CSlicePtr<i32, TrackingAlloc>>(),
+            core::mem::size_of::<CBufPtr<i32, TrackingAlloc>>(),
             core::mem::size_of::<*mut i32>()
         );
         assert_eq!(
-            core::mem::align_of::<CSlicePtr<i32, TrackingAlloc>>(),
+            core::mem::align_of::<CBufPtr<i32, TrackingAlloc>>(),
             core::mem::align_of::<*mut i32>()
         );
     }
 
     #[gtest]
-    fn c_slice_ptr_with_len_vec_mut_libc() {
-        let mut ptr = CSlicePtr::<i32>::null();
+    fn c_buf_ptr_with_len_vec_mut_libc() {
+        let mut ptr = CBufPtr::<i32>::null();
         let mut count: c_int = 0;
         let mut handle = unsafe { ptr.with_len_vec_mut(&mut count) };
         handle.push_back(123);
