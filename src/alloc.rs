@@ -107,9 +107,17 @@ unsafe impl Allocator for LibcAlloc {
     unsafe fn grow(
         &self,
         ptr: NonNull<u8>,
-        _old_layout: Layout,
+        old_layout: Layout,
         new_layout: Layout,
     ) -> Result<NonNull<[u8]>, AllocError> {
+        if new_layout.size() == 0 {
+            // SAFETY: The caller ensures `ptr` was allocated with `old_layout`.
+            unsafe { self.deallocate(ptr, old_layout) };
+            return Ok(dangling_slice(new_layout));
+        }
+        if old_layout.size() == 0 {
+            return self.allocate(new_layout);
+        }
         if new_layout.align() > MALLOC_ALIGN {
             return Err(AllocError);
         }
