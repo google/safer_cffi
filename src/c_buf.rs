@@ -43,7 +43,7 @@
 //!     // Mutable vector accessor — returns CVecRefMut (from &mut self and &mut item_len).
 //!     fn items_vec_mut(&mut self) -> CVecRefMut<'_, f32, c_int> {
 //!         // SAFETY: the length of `items` is `item_len`.
-//!         unsafe { self.items.with_len_vec_mut(&mut self.item_len) }
+//!         unsafe { self.items.as_vec_mut(&mut self.item_len) }
 //!     }
 //! }
 //!
@@ -69,11 +69,12 @@
 //! my_struct.items_vec_mut().clear();
 //! ```
 
-use crate::alloc::LibcAlloc;
+use crate::alloc::{DropByPtrAllocator, LibcAlloc};
 use crate::c_vec::CVecRefMut;
 use crate::errors::AllocError;
 use allocator_api2::alloc::{Allocator, Layout};
 use core::marker::PhantomData;
+use core::ops::{Deref, DerefMut};
 use core::ptr::{self, NonNull};
 
 /// The maximum slice length for type `T` that stays within the
@@ -116,24 +117,32 @@ pub(crate) const fn max_slice_len<T>() -> usize {
 /// 4. **No Interior Mutability**: `Self` must not use interior mutability (`Cell`, `UnsafeCell`,
 ///    `Atomic*`, etc.) to change its conversion output over time.
 pub unsafe trait CBufLen:
-    Copy + TryInto<usize> + TryFrom<usize> + Default + 'static
+    Copy + TryInto<usize, Error: core::fmt::Debug> + TryFrom<usize> + Default + 'static
 {
 }
 
 // SAFETY: Primitive unsigned integer types satisfy purity, determinism,
 // and round-trip conversion to/from `usize` within their representable ranges.
 unsafe impl CBufLen for usize {}
+// SAFETY: see usize
 unsafe impl CBufLen for u8 {}
+// SAFETY: see usize
 unsafe impl CBufLen for u16 {}
+// SAFETY: see usize
 unsafe impl CBufLen for u32 {}
+// SAFETY: see usize
 unsafe impl CBufLen for u64 {}
 
 // SAFETY: Primitive signed integer types satisfy purity, determinism,
 // and correctly fail conversion via `TryInto<usize>` on negative values.
 unsafe impl CBufLen for isize {}
+// SAFETY: see isize
 unsafe impl CBufLen for i8 {}
+// SAFETY: see isize
 unsafe impl CBufLen for i16 {}
+// SAFETY: see isize
 unsafe impl CBufLen for i32 {}
+// SAFETY: see isize
 unsafe impl CBufLen for i64 {}
 
 // ---------------------------------------------------------------------------
@@ -145,7 +154,7 @@ unsafe impl CBufLen for i64 {}
 ///
 /// `CBufPtr` provides [`with_len`](Self::with_len) to get a `&[T]` slice,
 /// [`with_len_mut`](Self::with_len_mut) to get a `&mut [T]` slice,
-/// [`with_len_vec_mut`](Self::with_len_vec_mut) to create a [`CVecRefMut`] handle,
+/// [`as_vec_mut`](Self::as_vec_mut) to create a [`CVecRefMut`] handle,
 /// and [`clone_and_leak`](Self::clone_and_leak) to clone a Rust slice into a
 /// C-allocated buffer.
 ///
@@ -160,6 +169,7 @@ unsafe impl CBufLen for i64 {}
 /// - The pointer is always aligned for `T`.
 /// - If the pointer is non-null, it has been allocated with the allocator `A` with layout
 ///   matching `Layout::array::<T>(len)`.
+#[derive(Default)]
 #[repr(transparent)]
 pub struct CBufPtr<T, A = LibcAlloc> {
     ptr: *mut T,
@@ -267,7 +277,7 @@ impl<T, A: Allocator> CBufPtr<T, A> {
     /// # Panics
     ///
     /// Panics if `*len` is negative or exceeds the maximum safe slice length.
-    pub unsafe fn with_len_vec_mut_in<'a, L: CBufLen>(
+    pub unsafe fn as_vec_mut_in<'a, L: CBufLen>(
         &'a mut self,
         len: &'a mut L,
         alloc: A,
@@ -283,7 +293,51 @@ impl<T, A: Allocator> CBufPtr<T, A> {
         // validity to deallocate/reallocate, and absence of aliases.
         // `&mut self` ties the lifetime of the returned `CVecRefMut` to the exclusive borrow,
         // preventing aliasing through `self`.
-        CVecRefMut { ptr: self, len, alloc }
+        CVecRefMut { ptr: self, len, capacity: None, alloc }
+    }
+
+    /// Create a capacity-tracking mutable vector handle with a custom [`Allocator`].
+    ///
+    /// Unlike [`as_vec_mut_in`](Self::as_vec_mut_in), the returned [`CVecRefMut`] also
+    /// borrows a separate `cap` field describing how many elements the allocation can
+    /// hold. This lets [`push_back`](CVecRefMut::push_back) append into spare capacity
+    /// without reallocating and grow geometrically once full, saving reallocations.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that:
+    /// - `*cap` reflects the exact number of elements the allocation pointed to by
+    ///   `self.ptr` can hold (or 0 if `self.ptr` is null).
+    /// - `*len` reflects the exact number of initialized elements, and `*len <= *cap`.
+    /// - The instance of `A` passed to this function MUST BE the same instance that was
+    ///   used for allocation of `self`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `*len` or `*cap` is negative, if `*cap` exceeds the maximum safe slice
+    /// length, or if `*len > *cap`.
+    pub unsafe fn as_vec_mut_with_cap_in<'a, L: CBufLen, C: CBufLen>(
+        &'a mut self,
+        len: &'a mut L,
+        cap: &'a mut C,
+        alloc: A,
+    ) -> CVecRefMut<'a, T, L, A, C> {
+        let Ok(slice_len): Result<usize, _> = (*len).try_into() else {
+            panic!("CBufPtr: len is negative");
+        };
+        let Ok(slice_cap): Result<usize, _> = (*cap).try_into() else {
+            panic!("CBufPtr: cap is negative");
+        };
+        assert!(
+            slice_cap <= max_slice_len::<T>(),
+            "CBufPtr: cap {slice_cap} exceeds maximum safe slice length"
+        );
+        assert!(slice_len <= slice_cap, "CBufPtr: len {slice_len} exceeds cap {slice_cap}");
+        // SAFETY: The caller guarantees the pointer/len/cap invariant, allocator compatibility,
+        // validity to deallocate/reallocate, and absence of aliases.
+        // `&mut self` ties the lifetime of the returned `CVecRefMut` to the exclusive borrow,
+        // preventing aliasing through `self`.
+        CVecRefMut { ptr: self, len, capacity: Some(cap), alloc }
     }
 
     /// Clone the contents of a Rust slice into a new C-allocated buffer using a custom [`Allocator`].
@@ -396,14 +450,42 @@ impl<T> CBufPtr<T, LibcAlloc> {
     /// # Panics
     ///
     /// Panics if `*len` is negative or exceeds the maximum safe slice length.
-    pub unsafe fn with_len_vec_mut<'a, L: CBufLen>(
+    pub unsafe fn as_vec_mut<'a, L: CBufLen>(
         &'a mut self,
         len: &'a mut L,
     ) -> CVecRefMut<'a, T, L, LibcAlloc> {
         // SAFETY: The caller guarantees `len` is the exact length and no active aliases exist.
         // Compatibility with `LibcAlloc` is an invariant of `CBufPtr<T, LibcAlloc>` and the
         // fact that all instances of LibcAlloc are equivalent.
-        unsafe { self.with_len_vec_mut_in(len, LibcAlloc) }
+        unsafe { self.as_vec_mut_in(len, LibcAlloc) }
+    }
+
+    /// Create a capacity-tracking mutable vector handle backed by [`LibcAlloc`].
+    ///
+    /// Like [`as_vec_mut`](Self::as_vec_mut), but also borrows a separate `cap` field so
+    /// that [`push_back`](CVecRefMut::push_back) can append into spare capacity without
+    /// reallocating and grow geometrically once full, saving reallocations. The capacity
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that:
+    /// - `*cap` reflects the exact number of elements the allocation pointed to by
+    ///   `self.ptr` can hold (or 0 if `self.ptr` is null).
+    /// - `*len` reflects the exact number of initialized elements, and `*len <= *cap`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `*len` or `*cap` is negative, if `*cap` exceeds the maximum safe slice
+    /// length, or if `*len > *cap`.
+    pub unsafe fn as_vec_mut_with_cap<'a, L: CBufLen, C: CBufLen>(
+        &'a mut self,
+        len: &'a mut L,
+        cap: &'a mut C,
+    ) -> CVecRefMut<'a, T, L, LibcAlloc, C> {
+        // SAFETY: The caller guarantees `len`/`cap` describe the buffer exactly and no active
+        // aliases exist. Compatibility with `LibcAlloc` is an invariant of `CBufPtr<T, LibcAlloc>`
+        // and the fact that all instances of LibcAlloc are equivalent.
+        unsafe { self.as_vec_mut_with_cap_in(len, cap, LibcAlloc) }
     }
 
     /// Clone the contents of a Rust slice into a new C-allocated buffer using [`LibcAlloc`].
@@ -436,6 +518,103 @@ unsafe impl<T: Send, A> Send for CBufPtr<T, A> {}
 impl<T, A> core::fmt::Debug for CBufPtr<T, A> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_tuple("CBufPtr").field(&self.ptr).finish()
+    }
+}
+
+/// A [`CBufPtr`] that owns the allocated buffer.
+///
+/// This is a wrapper around [`CBufPtr`] that automatically deallocates the buffer when the
+/// wrapper is dropped.
+///
+/// We require `T` to be `Copy`, as this implies `!Drop`, which means we can just free the pointer
+/// and don't need the length of the buffer to call `Drop` on each element.
+///
+/// To transfer ownership back across the FFI boundary or leak the pointer without triggering
+/// `Drop`, use [`into_c_buf_ptr`](Self::into_c_buf_ptr) or [`into_raw`](Self::into_raw).
+///
+/// # Safety Invariants
+///
+/// - All safety invariants of the inner [`CBufPtr<T, A>`] hold.
+/// - If the inner pointer is non-null and `size_of::<T>() > 0`, this `OwnedCBufPtr`
+///   has exclusive ownership of the underlying heap allocation allocated by `A`.
+/// - No other owner or alias will deallocate or access the allocation after this
+///   `OwnedCBufPtr` is dropped (unless ownership is explicitly transferred out via
+///   [`into_c_buf_ptr`](Self::into_c_buf_ptr) or [`into_raw`](Self::into_raw)).
+#[repr(transparent)]
+#[derive(Debug, Default)]
+pub struct OwnedCBufPtr<T: Copy, A: DropByPtrAllocator = LibcAlloc>(CBufPtr<T, A>);
+
+impl<T: Copy, A: DropByPtrAllocator> Drop for OwnedCBufPtr<T, A> {
+    fn drop(&mut self) {
+        if core::mem::size_of::<T>() == 0 {
+            return;
+        }
+        let Some(ptr) = NonNull::new(self.0.ptr.cast::<u8>()) else {
+            return;
+        };
+        // SAFETY:
+        // - By the safety invariants of `OwnedCBufPtr`, since `ptr` is non-null and
+        //   `size_of::<T>() > 0`, `ptr` denotes a live, non-zero-sized block of memory
+        //   allocated via `A`.
+        // - Because `T: Copy`, `T` does not implement `Drop`, so no element destructors
+        //   need to be called before freeing the memory.
+        // - `OwnedCBufPtr` holds exclusive ownership of the allocation, and since we are
+        //   in `Drop::drop(&mut self)`, no references or aliases to the memory exist or
+        //   can be used after this call.
+        unsafe {
+            A::deallocate_by_ptr(ptr);
+        }
+    }
+}
+
+impl<T: Copy, A: DropByPtrAllocator> OwnedCBufPtr<T, A> {
+    /// Create a null `OwnedCBufPtr`.
+    pub const fn null() -> Self {
+        Self(CBufPtr::null())
+    }
+
+    /// Construct an `OwnedCBufPtr` from a raw pointer, transferring ownership of the allocation.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that:
+    /// - `raw` satisfies all the safety invariants of [`CBufPtr<T, A>`] (including that if
+    ///   non-null, it is properly aligned for `T` and was allocated by `A`).
+    /// - If `raw` is non-null and `size_of::<T>() > 0`, `raw` points to a live, non-zero-sized
+    ///   allocation from `A`, and exclusive ownership of that allocation is transferred to
+    ///   the returned `OwnedCBufPtr`.
+    /// - After this call, the caller must not deallocate `raw` or access the memory through any
+    ///   other pointer or reference not derived from this `OwnedCBufPtr`.
+    pub const unsafe fn from_raw(raw: *mut T) -> Self {
+        // SAFETY: The caller guarantees that `raw` satisfies all safety invariants of `CBufPtr<T, A>`
+        // and transfers exclusive ownership of the allocation to this `OwnedCBufPtr`.
+        Self(unsafe { CBufPtr::from_raw(raw) })
+    }
+
+    /// Consumes the `OwnedCBufPtr`, returning the wrapped [`CBufPtr`] without deallocating it.
+    pub fn into_c_buf_ptr(self) -> CBufPtr<T, A> {
+        let ptr = self.0.ptr;
+        core::mem::forget(self);
+        CBufPtr { ptr, _allocator: PhantomData }
+    }
+
+    /// Consumes the `OwnedCBufPtr`, returning the inner raw pointer without deallocating it.
+    pub fn into_raw(self) -> *mut T {
+        self.into_c_buf_ptr().as_ptr()
+    }
+}
+
+impl<T: Copy, A: DropByPtrAllocator> Deref for OwnedCBufPtr<T, A> {
+    type Target = CBufPtr<T, A>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T: Copy, A: DropByPtrAllocator> DerefMut for OwnedCBufPtr<T, A> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
     }
 }
 
@@ -532,7 +711,7 @@ mod tests {
         let mut count: c_int = 3;
         let mut ptr = cloned;
         // SAFETY: `ptr` was allocated via `alloc` with `count` elements.
-        let mut handle = unsafe { ptr.with_len_vec_mut_in(&mut count, &alloc) };
+        let mut handle = unsafe { ptr.as_vec_mut_in(&mut count, &alloc) };
         handle.clear();
         assert_that!(alloc.dealloc_count.load(Ordering::SeqCst), eq(1));
     }
@@ -671,10 +850,10 @@ mod tests {
     }
 
     #[gtest]
-    fn c_buf_ptr_with_len_vec_mut_libc() {
+    fn c_buf_ptr_as_vec_mut_libc() {
         let mut ptr = CBufPtr::<i32>::null();
         let mut count: c_int = 0;
-        let mut handle = unsafe { ptr.with_len_vec_mut(&mut count) };
+        let mut handle = unsafe { ptr.as_vec_mut(&mut count) };
         handle.push_back(123);
         assert_that!(&*handle, container_eq([123]));
         handle.clear();
@@ -684,9 +863,142 @@ mod tests {
 
     #[gtest]
     #[should_panic(expected = "CBufPtr: len is negative")]
-    fn c_buf_ptr_with_len_vec_mut_negative_len() {
+    fn c_buf_ptr_as_vec_mut_negative_len() {
         let mut ptr = CBufPtr::<i32>::null();
         let mut count: c_int = -5;
-        let _ = unsafe { ptr.with_len_vec_mut(&mut count) };
+        let _ = unsafe { ptr.as_vec_mut(&mut count) };
+    }
+
+    // -----------------------------------------------------------------------
+    //  OwnedCBufPtr tests
+    // -----------------------------------------------------------------------
+
+    static GLOBAL_ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static GLOBAL_DEALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Default, Clone, Copy, Debug)]
+    struct GlobalTrackingAlloc;
+
+    unsafe impl Allocator for GlobalTrackingAlloc {
+        fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+            GLOBAL_ALLOC_COUNT.fetch_add(1, Ordering::SeqCst);
+            LibcAlloc.allocate(layout)
+        }
+
+        unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+            GLOBAL_DEALLOC_COUNT.fetch_add(1, Ordering::SeqCst);
+            unsafe { LibcAlloc.deallocate(ptr, layout) };
+        }
+    }
+
+    impl DropByPtrAllocator for GlobalTrackingAlloc {
+        unsafe fn deallocate_by_ptr(ptr: NonNull<u8>) {
+            GLOBAL_DEALLOC_COUNT.fetch_add(1, Ordering::SeqCst);
+            unsafe { LibcAlloc::deallocate_by_ptr(ptr) };
+        }
+    }
+
+    #[gtest]
+    fn owned_c_buf_ptr_layout() {
+        assert_eq!(core::mem::size_of::<OwnedCBufPtr<i32>>(), core::mem::size_of::<*mut i32>());
+        assert_eq!(core::mem::align_of::<OwnedCBufPtr<i32>>(), core::mem::align_of::<*mut i32>());
+        assert_eq!(
+            core::mem::size_of::<OwnedCBufPtr<i32, GlobalTrackingAlloc>>(),
+            core::mem::size_of::<*mut i32>()
+        );
+        assert_eq!(
+            core::mem::align_of::<OwnedCBufPtr<i32, GlobalTrackingAlloc>>(),
+            core::mem::align_of::<*mut i32>()
+        );
+    }
+
+    #[gtest]
+    fn owned_c_buf_ptr_null() {
+        let owned = OwnedCBufPtr::<i32>::null();
+        assert!(owned.is_null());
+        assert!(owned.as_ptr().is_null());
+        let slice = unsafe { owned.with_len(0) };
+        assert!(slice.is_empty());
+        // Dropping null OwnedCBufPtr must be safe.
+    }
+
+    #[gtest]
+    fn owned_c_buf_ptr_zst_drop() {
+        let cloned = CBufPtr::try_clone_and_leak(&[(), (), ()]).unwrap();
+        assert!(!cloned.is_null());
+        let owned = unsafe { OwnedCBufPtr::<()>::from_raw(cloned.as_ptr()) };
+        assert_that!(unsafe { owned.with_len(3) }, container_eq([(), (), ()]));
+        // Dropping owned with non-null dangling ZST pointer must not call free().
+    }
+
+    #[gtest]
+    fn owned_c_buf_ptr_from_raw_and_drop_libc() {
+        let (ptr, len) = unsafe { malloc_array([10, 20, 30]) };
+        let mut owned: OwnedCBufPtr<_> = unsafe { OwnedCBufPtr::from_raw(ptr.as_ptr()) };
+        assert!(!owned.is_null());
+
+        // Test Deref to CBufPtr
+        let slice = unsafe { owned.with_len(len) };
+        assert_that!(slice, container_eq([10, 20, 30]));
+
+        // Test DerefMut to CBufPtr
+        let slice_mut = unsafe { owned.with_len_mut(len) };
+        slice_mut[1] = 200;
+        assert_that!(unsafe { owned.with_len(len) }, container_eq([10, 200, 30]));
+
+        // Test Debug formatting
+        let debug_str = format!("{:?}", owned);
+        assert!(debug_str.starts_with("OwnedCBufPtr("));
+    }
+
+    #[gtest]
+    fn owned_c_buf_ptr_custom_allocator_and_drop() {
+        GLOBAL_ALLOC_COUNT.store(0, Ordering::SeqCst);
+        GLOBAL_DEALLOC_COUNT.store(0, Ordering::SeqCst);
+
+        let cloned = CBufPtr::try_clone_and_leak_in(&[1, 2, 3, 4], GlobalTrackingAlloc).unwrap();
+        assert_that!(GLOBAL_ALLOC_COUNT.load(Ordering::SeqCst), eq(1));
+        assert_that!(GLOBAL_DEALLOC_COUNT.load(Ordering::SeqCst), eq(0));
+
+        {
+            let mut owned =
+                unsafe { OwnedCBufPtr::<i32, GlobalTrackingAlloc>::from_raw(cloned.as_ptr()) };
+            assert!(!owned.is_null());
+
+            assert_that!(unsafe { owned.with_len(4) }, container_eq([1, 2, 3, 4]));
+            unsafe {
+                owned.with_len_mut(4)[0] = 42;
+            };
+            assert_that!(unsafe { owned.with_len(4) }, container_eq([42, 2, 3, 4]));
+        }
+
+        // Dropping owned must call deallocate_by_ptr on the custom allocator.
+        assert_that!(GLOBAL_DEALLOC_COUNT.load(Ordering::SeqCst), eq(1));
+    }
+
+    #[gtest]
+    fn owned_c_buf_ptr_into_c_buf_ptr_and_into_raw() {
+        GLOBAL_ALLOC_COUNT.store(0, Ordering::SeqCst);
+        GLOBAL_DEALLOC_COUNT.store(0, Ordering::SeqCst);
+
+        let cloned = CBufPtr::try_clone_and_leak_in(&[5, 6, 7], GlobalTrackingAlloc).unwrap();
+        let owned = unsafe { OwnedCBufPtr::<i32, GlobalTrackingAlloc>::from_raw(cloned.as_ptr()) };
+
+        // Consuming owned via into_c_buf_ptr should not deallocate.
+        let buf_ptr: CBufPtr<i32, GlobalTrackingAlloc> = owned.into_c_buf_ptr();
+        assert_that!(GLOBAL_DEALLOC_COUNT.load(Ordering::SeqCst), eq(0));
+        assert_that!(unsafe { buf_ptr.with_len(3) }, container_eq([5, 6, 7]));
+
+        // Re-wrap and test into_raw.
+        let owned2 =
+            unsafe { OwnedCBufPtr::<i32, GlobalTrackingAlloc>::from_raw(buf_ptr.as_ptr()) };
+        let raw = owned2.into_raw();
+        assert_that!(GLOBAL_DEALLOC_COUNT.load(Ordering::SeqCst), eq(0));
+        assert_that!(unsafe { core::slice::from_raw_parts(raw, 3) }, container_eq([5, 6, 7]));
+
+        // Re-wrap and drop to verify cleanup.
+        let owned3 = unsafe { OwnedCBufPtr::<i32, GlobalTrackingAlloc>::from_raw(raw) };
+        drop(owned3);
+        assert_that!(GLOBAL_DEALLOC_COUNT.load(Ordering::SeqCst), eq(1));
     }
 }
