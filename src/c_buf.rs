@@ -83,49 +83,10 @@ use core::ptr::{self, NonNull};
 /// comparison against it is optimized away by the compiler.
 pub(crate) const fn max_slice_len<T>() -> usize {
     if core::mem::size_of::<T>() == 0 {
-        panic!("T has zero size")
+        usize::MAX
     } else {
         isize::MAX as usize / core::mem::size_of::<T>()
     }
-}
-
-/// Static type assertions for `CBufPtr`.
-const fn slice_type_assertions<T>() {
-    // Ensure that `T` is no larger than the alignment provided by `malloc`.
-    // This is a constraint because we use `malloc` to allocate the buffer, and if `T` is
-    // over-aligned, we cannot guarantee correct alignment.
-    //
-    // If this ever becomes an issue, consider using `aligned_alloc` instead of `malloc`.
-    // We currently favor the universal availability of `malloc` over supporting
-    // complex types.
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", target_os = "ios"))]
-    const MALLOC_ALIGN: usize = core::mem::align_of::<libc::max_align_t>();
-
-    #[cfg(not(any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "windows",
-        target_os = "ios"
-    )))]
-    const MALLOC_ALIGN: usize = {
-        // Fallback for weird platforms: Do an approximation at compile time,
-        // but also check the alignment at runtime below to avoid UB.
-        #[repr(C)]
-        union MallocAlignProxy {
-            _a: f64,
-            _b: u64,
-            _c: *const (),
-        }
-        core::mem::align_of::<MallocAlignProxy>()
-    };
-    assert!(
-        core::mem::align_of::<T>() <= MALLOC_ALIGN,
-        "T is over-aligned for a standard malloc call"
-    );
-
-    // Ensure that `T` is not a zero-sized type (ZST). We only want to support C-native types,
-    // and ZSTs are not a thing in C.
-    assert!(core::mem::size_of::<T>() > 0, "T has zero size, which is not supported");
 }
 
 // ---------------------------------------------------------------------------
@@ -137,7 +98,7 @@ const fn slice_type_assertions<T>() {
 /// This trait is implemented for primitive integer types commonly used in C FFIs
 /// (e.g. `c_int`, `usize`, `u32`, `i32`, etc.).
 ///
-/// # Safety invariant:
+/// # Safety
 ///
 /// Safe methods on [`CVecRefMut`] (such as
 /// [`as_slice`](CVecRefMut::as_slice), [`as_slice_mut`](CVecRefMut::as_slice_mut),
@@ -151,7 +112,7 @@ const fn slice_type_assertions<T>() {
 /// 2. **Round-trip Equivalence**: For any `n: usize` that successfully converts to
 ///    `L = Self::try_from(n)`, `L.try_into()` must return `Ok(n)`.
 /// 3. **Non-negative handling**: For signed types, negative values must fail conversion
-///    via `TryInto<usize>` (returning `Err`), ensuring they are safely treated as length 0.
+///    via `TryInto<usize>` (returning `Err`).
 /// 4. **No Interior Mutability**: `Self` must not use interior mutability (`Cell`, `UnsafeCell`,
 ///    `Atomic*`, etc.) to change its conversion output over time.
 pub unsafe trait CBufLen:
@@ -199,10 +160,6 @@ unsafe impl CBufLen for i64 {}
 /// - The pointer is always aligned for `T`.
 /// - If the pointer is non-null, it has been allocated with the allocator `A` with layout
 ///   matching `Layout::array::<T>(len)`.
-///
-/// Additional invariants enforced by compile-time assertions in [`from_raw`]:
-/// - `T` is not a zero-sized type, i.e. `size_of::<T>() > 0`.
-/// - `T` is not over-aligned for a standard `malloc` call.
 #[repr(transparent)]
 pub struct CBufPtr<T, A = LibcAlloc> {
     ptr: *mut T,
@@ -212,9 +169,6 @@ pub struct CBufPtr<T, A = LibcAlloc> {
 impl<T, A: Allocator> CBufPtr<T, A> {
     /// Create a null `CBufPtr`.
     pub const fn null() -> Self {
-        const {
-            slice_type_assertions::<T>();
-        }
         // SAFETY: null pointers trivially satisfy all other safety invariants of CBufPtr.
         Self { ptr: ptr::null_mut(), _allocator: PhantomData }
     }
@@ -224,12 +178,9 @@ impl<T, A: Allocator> CBufPtr<T, A> {
     /// # Safety
     ///
     /// The caller must ensure that `raw` satisfies all the safety invariants of
-    /// [`CBufPtr`], including that if non-null, it points to memory allocated
+    /// [`CBufPtr`], including that if non-null, it points to properly aligned memory allocated
     /// by the allocator `A`.
     pub const unsafe fn from_raw(raw: *mut T) -> Self {
-        const {
-            slice_type_assertions::<T>();
-        }
         Self { ptr: raw, _allocator: PhantomData }
     }
 
@@ -246,8 +197,7 @@ impl<T, A: Allocator> CBufPtr<T, A> {
     /// Create a shared (read-only) slice view with the given element length.
     ///
     /// Returns a plain `&[T]` whose lifetime is tied to `&self`, preventing
-    /// mutation while the returned slice exists. If len is negative, clamp
-    /// it to zero.
+    /// mutation while the returned slice exists.
     ///
     /// # Safety
     ///
@@ -255,13 +205,18 @@ impl<T, A: Allocator> CBufPtr<T, A> {
     ///
     /// # Panics
     ///
-    /// Panics if `len` exceeds the maximum safe slice length.
+    /// Panics if `len` is negative or exceeds the maximum safe slice length.
     pub unsafe fn with_len<L: CBufLen>(&self, len: L) -> &[T] {
-        let len: usize = len.try_into().unwrap_or(0);
+        let Ok(len): Result<usize, _> = len.try_into() else {
+            panic!("CBufPtr: len is negative");
+        };
         if self.ptr.is_null() || len == 0 {
             return &[];
         }
-        assert!(len <= max_slice_len::<T>(), "CBufPtr: len exceeds maximum safe slice length");
+        assert!(
+            len <= max_slice_len::<T>(),
+            "CBufPtr: len {len} exceeds maximum safe slice length"
+        );
         // SAFETY: The caller guarantees that `self.ptr` points to at least `len` initialised
         // elements of type `T`. `&self` ties the lifetime of the returned slice to the borrow.
         unsafe { core::slice::from_raw_parts(self.ptr, len) }
@@ -271,7 +226,6 @@ impl<T, A: Allocator> CBufPtr<T, A> {
     ///
     /// The lifetime of the result is tied to the exclusive borrow `&'a mut self`, preventing
     /// aliasing.
-    /// If `len` is negative, it is clamped to zero.
     ///
     /// # Safety
     ///
@@ -280,23 +234,23 @@ impl<T, A: Allocator> CBufPtr<T, A> {
     ///
     /// # Panics
     ///
-    /// Panics if `len` exceeds the maximum safe slice length.
+    /// Panics if `len` is negative or exceeds the maximum safe slice length.
     pub unsafe fn with_len_mut<L: CBufLen>(&mut self, len: L) -> &mut [T] {
-        let slice_len: usize = len.try_into().unwrap_or(0);
-        assert!(
-            slice_len <= max_slice_len::<T>(),
-            "CBufPtr: len exceeds maximum safe slice length"
-        );
-        if self.ptr.is_null() || slice_len == 0 {
+        let Ok(len): Result<usize, _> = len.try_into() else {
+            panic!("CBufPtr: len is negative");
+        };
+        if self.ptr.is_null() || len == 0 {
             return &mut [];
         }
-        // SAFETY: The caller guarantees `self.ptr` is valid for reads and writes for `slice_len`
+        assert!(
+            len <= max_slice_len::<T>(),
+            "CBufPtr: len {len} exceeds maximum safe slice length"
+        );
+        // SAFETY: The caller guarantees `self.ptr` is valid for reads and writes for `len`
         // elements of type `T`, properly aligned, and unaliased for `'a`.
-        unsafe { core::slice::from_raw_parts_mut(self.ptr, slice_len) }
+        unsafe { core::slice::from_raw_parts_mut(self.ptr, len) }
     }
-}
 
-impl<T, A: Allocator + PartialEq> CBufPtr<T, A> {
     /// Create a mutable vector handle with the given element length and custom [`Allocator`].
     ///
     /// This is the primary way to construct a [`CVecRefMut`]. The lifetime
@@ -306,22 +260,24 @@ impl<T, A: Allocator + PartialEq> CBufPtr<T, A> {
     /// # Safety
     ///
     /// The caller must ensure that:
-    /// - `len` reflects the exact number of initialized elements pointed to by `self.ptr` (or `<= 0` if empty).
+    /// - `len` reflects the exact number of initialized elements pointed to by `self.ptr` (or 0 if empty).
     /// - The instance of `A` passed to this function MUST BE the same instance that was used for
     ///   allocation of `self`.
     ///
     /// # Panics
     ///
-    /// Panics if `len` exceeds the maximum safe slice length.
+    /// Panics if `*len` is negative or exceeds the maximum safe slice length.
     pub unsafe fn with_len_vec_mut_in<'a, L: CBufLen>(
         &'a mut self,
         len: &'a mut L,
         alloc: A,
     ) -> CVecRefMut<'a, T, L, A> {
-        let slice_len: usize = (*len).try_into().unwrap_or(0);
+        let Ok(slice_len): Result<usize, _> = (*len).try_into() else {
+            panic!("CBufPtr: len is negative");
+        };
         assert!(
             slice_len <= max_slice_len::<T>(),
-            "CBufPtr: len exceeds maximum safe slice length"
+            "CBufPtr: len {slice_len} exceeds maximum safe slice length"
         );
         // SAFETY: The caller guarantees the pointer/len invariant, allocator compatibility,
         // validity to deallocate/reallocate, and absence of aliases.
@@ -435,11 +391,11 @@ impl<T> CBufPtr<T, LibcAlloc> {
     /// # Safety
     ///
     /// The caller must ensure that:
-    /// - `len` reflects the exact number of initialized elements pointed to by `self.ptr` (or `<= 0` if empty).
+    /// - `len` reflects the exact number of initialized elements pointed to by `self.ptr` (or 0 if empty).
     ///
     /// # Panics
     ///
-    /// Panics if `len` exceeds the maximum safe slice length.
+    /// Panics if `*len` is negative or exceeds the maximum safe slice length.
     pub unsafe fn with_len_vec_mut<'a, L: CBufLen>(
         &'a mut self,
         len: &'a mut L,
@@ -516,10 +472,10 @@ mod tests {
     }
 
     #[gtest]
+    #[should_panic(expected = "CBufPtr: len is negative")]
     fn with_len_negative_len() {
         let ptr = CBufPtr::<i32>::null();
-        let s = unsafe { ptr.with_len(-5) };
-        assert_that!(s.len(), eq(0));
+        let _ = unsafe { ptr.with_len(-5) };
     }
 
     #[gtest]
@@ -673,6 +629,13 @@ mod tests {
         assert_that!(collected.len(), eq(0));
     }
 
+    #[gtest]
+    #[should_panic(expected = "CBufPtr: len is negative")]
+    fn cslice_with_len_mut_negative_len() {
+        let mut ptr = CBufPtr::<i32>::null();
+        let _ = unsafe { ptr.with_len_mut(-5) };
+    }
+
     // -----------------------------------------------------------------------
     //  Generic Len tests (usize, u32, u8, i8, isize, u64)
     // -----------------------------------------------------------------------
@@ -690,22 +653,6 @@ mod tests {
         let null_ptr = CBufPtr::<i32>::null();
         let empty = unsafe { null_ptr.with_len(0usize) };
         assert!(empty.is_empty());
-    }
-
-    #[gtest]
-    fn cslice_with_len_signed_negative() {
-        let ptr = CBufPtr::<i32>::null();
-        let s_i8 = unsafe { ptr.with_len(-1i8) };
-        assert!(s_i8.is_empty());
-
-        let s_i16 = unsafe { ptr.with_len(-10i16) };
-        assert!(s_i16.is_empty());
-
-        let s_isize = unsafe { ptr.with_len(-100isize) };
-        assert!(s_isize.is_empty());
-
-        let s_i64 = unsafe { ptr.with_len(-1000i64) };
-        assert!(s_i64.is_empty());
     }
 
     #[gtest]
@@ -733,5 +680,13 @@ mod tests {
         handle.clear();
         assert!(ptr.is_null());
         assert_that!(count, eq(0));
+    }
+
+    #[gtest]
+    #[should_panic(expected = "CBufPtr: len is negative")]
+    fn c_buf_ptr_with_len_vec_mut_negative_len() {
+        let mut ptr = CBufPtr::<i32>::null();
+        let mut count: c_int = -5;
+        let _ = unsafe { ptr.with_len_vec_mut(&mut count) };
     }
 }

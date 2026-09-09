@@ -35,14 +35,14 @@ use core::ptr::{self, NonNull};
 /// # Safety Invariant
 ///
 /// If `len > 0`, it is the length of array `ptr`, and must be <= `isize::MAX`.
-/// If `len <= 0`, the array is empty.
-pub struct CVecRefMut<'a, T, L: CBufLen, A: Allocator + PartialEq = LibcAlloc> {
+/// If `len == 0`, the array is empty.
+pub struct CVecRefMut<'a, T, L: CBufLen, A: Allocator = LibcAlloc> {
     pub(crate) ptr: &'a mut CBufPtr<T, A>,
     pub(crate) len: &'a mut L,
     pub(crate) alloc: A,
 }
 
-impl<'a, T, L: CBufLen, A: Allocator + PartialEq> CVecRefMut<'a, T, L, A> {
+impl<'a, T, L: CBufLen, A: Allocator> CVecRefMut<'a, T, L, A> {
     /// Return the slice view with the lifetime tied to the borrow.
     #[inline]
     pub fn as_slice(&self) -> &[T] {
@@ -157,16 +157,6 @@ impl<'a, T, L: CBufLen, A: Allocator + PartialEq> CVecRefMut<'a, T, L, A> {
         }
     }
 
-    /// Swap the underlying pointer and len with another handle that uses the same allocator.
-    ///
-    /// # Panics
-    /// Panics if `self` and `other` do not share the same allocator instance (as determined by [`PartialEq`]).
-    pub fn swap(&mut self, other: &mut CVecRefMut<'_, T, L, A>) {
-        assert!(self.alloc == other.alloc, "CVecRefMut::swap: handles must use the same allocator");
-        core::mem::swap(self.ptr, other.ptr);
-        core::mem::swap(self.len, other.len);
-    }
-
     /// Drop all elements and deallocate the buffer using the configured [`Allocator`].
     pub fn clear(&mut self) {
         let len = (*self.len).try_into().unwrap_or(0);
@@ -208,7 +198,19 @@ impl<'a, T, L: CBufLen, A: Allocator + PartialEq> CVecRefMut<'a, T, L, A> {
     }
 }
 
-impl<T, L: CBufLen, A: Allocator + PartialEq> core::ops::Deref for CVecRefMut<'_, T, L, A> {
+impl<'a, T, L: CBufLen, A: Allocator + PartialEq> CVecRefMut<'a, T, L, A> {
+    /// Swap the underlying pointer and len with another handle that uses the same allocator.
+    ///
+    /// # Panics
+    /// Panics if `self` and `other` do not share the same allocator instance.
+    pub fn swap(&mut self, other: &mut CVecRefMut<'_, T, L, A>) {
+        assert!(self.alloc == other.alloc, "CVecRefMut::swap: handles must use the same allocator");
+        core::mem::swap(self.ptr, other.ptr);
+        core::mem::swap(self.len, other.len);
+    }
+}
+
+impl<T, L: CBufLen, A: Allocator> core::ops::Deref for CVecRefMut<'_, T, L, A> {
     type Target = [T];
 
     #[inline]
@@ -217,16 +219,14 @@ impl<T, L: CBufLen, A: Allocator + PartialEq> core::ops::Deref for CVecRefMut<'_
     }
 }
 
-impl<T, L: CBufLen, A: Allocator + PartialEq> core::ops::DerefMut for CVecRefMut<'_, T, L, A> {
+impl<T, L: CBufLen, A: Allocator> core::ops::DerefMut for CVecRefMut<'_, T, L, A> {
     #[inline]
     fn deref_mut(&mut self) -> &mut [T] {
         self.as_slice_mut()
     }
 }
 
-impl<T: core::fmt::Debug, L: CBufLen, A: Allocator + PartialEq> core::fmt::Debug
-    for CVecRefMut<'_, T, L, A>
-{
+impl<T: core::fmt::Debug, L: CBufLen, A: Allocator> core::fmt::Debug for CVecRefMut<'_, T, L, A> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         core::fmt::Debug::fmt(self.as_slice(), f)
     }
