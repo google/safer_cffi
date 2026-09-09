@@ -6,12 +6,12 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use safer_cffi::{CBufPtr, CVecRefMut};
+use safer_cffi::{CVecRefMut, OwnedCBufPtr};
 
 #[repr(C)]
 pub struct IntArray {
     // Safety invariant: the length of this array is `item_len`.
-    pub items: CBufPtr<i32>,
+    pub items: OwnedCBufPtr<i32>,
     pub item_len: i32,
 }
 
@@ -28,13 +28,7 @@ impl IntArray {
 
     pub fn items_vec_mut(&mut self) -> CVecRefMut<'_, i32, i32> {
         // SAFETY: the length of `items` is `item_len`.
-        unsafe { self.items.with_len_vec_mut(&mut self.item_len) }
-    }
-}
-
-impl Drop for IntArray {
-    fn drop(&mut self) {
-        self.items_vec_mut().clear();
+        unsafe { self.items.as_vec_mut(&mut self.item_len) }
     }
 }
 
@@ -44,7 +38,7 @@ impl Drop for IntArray {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn create_array() -> Option<Box<IntArray>> {
-    Some(Box::new(IntArray { items: CBufPtr::null(), item_len: 0 }))
+    Some(Box::new(IntArray { items: OwnedCBufPtr::null(), item_len: 0 }))
 }
 
 #[unsafe(no_mangle)]

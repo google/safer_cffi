@@ -35,14 +35,18 @@
 //!
 //! Many C structs contain `(*mut T, L)` field pairs representing dynamically-sized
 //! arrays (where `L` is an integer length type such as `c_int` or `usize`).
-//! [`CBufPtr`] and [`CVecRefMut`] provide safe handles over these pairs:
+//! [`CBufPtr`], [`OwnedCBufPtr`], and [`CVecRefMut`] provide safe handles over these pairs:
 //!
 //! - **[`CBufPtr`]**: A `#[repr(transparent)]` wrapper around `*mut T` for use in
 //!   `#[repr(C)]` struct definitions. Encodes the allocator type (defaulting to [`LibcAlloc`]).
 //!   Provides [`with_len`](CBufPtr::with_len) to get a `&[T]` slice,
 //!   [`with_len_mut`](CBufPtr::with_len_mut) to get a mutable `&mut [T]` slice,
-//!   [`with_len_vec_mut`](CBufPtr::with_len_vec_mut) to create a mutable `CVecRefMut`
+//!   [`as_vec_mut`](CBufPtr::as_vec_mut) to create a mutable `CVecRefMut`
 //!   handle, and [`clone_and_leak`](CBufPtr::clone_and_leak) to clone a Rust slice into a C-allocated buffer.
+//!
+//! - **[`OwnedCBufPtr`]**: A `#[repr(transparent)]` wrapper around [`CBufPtr`] for `Copy` types
+//!   that automatically frees the allocated buffer on drop. Dereferences to `CBufPtr` to provide
+//!   all its slice and vector accessor methods.
 //!
 //! - **[`CVecRefMut`]** (growable vector handle): Provides mutable slice access via
 //!   [`DerefMut`](core::ops::DerefMut), plus [`push_back`](CVecRefMut::push_back),
@@ -51,7 +55,7 @@
 //!
 //! All vector operations default to the **C allocator** (`malloc`/`free`) for allocations,
 //! ensuring compatibility with memory managed across the FFI boundary, and support custom
-//! [`Allocator`] implementations via `with_len_vec_mut_in` and `clone_and_leak_in`.
+//! [`Allocator`] implementations via `as_vec_mut_in` and `clone_and_leak_in`.
 
 pub(crate) mod alloc;
 pub(crate) mod c_buf;
@@ -65,12 +69,9 @@ pub(crate) mod raw;
 pub(crate) mod testing;
 pub(crate) mod tracker;
 
-pub use alloc::{CBox, LibcAlloc};
+pub use alloc::{CBox, DropByPtrAllocator, LibcAlloc};
 pub use allocator_api2::alloc::Allocator;
-pub use c_buf::{CBufLen, CBufPtr};
-/// Deprecated aliases
-#[doc(hidden)]
-pub use c_buf::{CBufLen as CSliceLen, CBufPtr as CSlicePtr};
+pub use c_buf::{CBufLen, CBufPtr, OwnedCBufPtr};
 pub use c_str::CStrRef;
 pub use c_vec::CVecRefMut;
 pub use errors::{AllocError, TrackerError};
