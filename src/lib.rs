@@ -68,9 +68,6 @@ pub(crate) mod tracker;
 pub use alloc::{CBox, LibcAlloc};
 pub use allocator_api2::alloc::Allocator;
 pub use c_buf::{CBufLen, CBufPtr};
-/// Deprecated aliases
-#[doc(hidden)]
-pub use c_buf::{CBufLen as CSliceLen, CBufPtr as CSlicePtr};
 pub use c_str::CStrRef;
 pub use c_vec::CVecRefMut;
 pub use errors::{AllocError, TrackerError};
