@@ -56,11 +56,11 @@
 //! let len = my_struct.items().len();
 //! for item in my_struct.items() { /* ... */ }
 //!
-//! // Mutate slice in place:
-//! my_struct.items_mut()[0] = 2.0;
-//!
 //! // Resizing / dynamic vector mutation:
 //! my_struct.items_vec_mut().push_back(40.0);
+//!
+//! // Mutate slice in place:
+//! my_struct.items_mut()[0] = 2.0;
 //!
 //! // Clone impl:
 //! let cloned_ptr: CBufPtr<f32> = CBufPtr::clone_and_leak(my_struct.items());
