@@ -133,7 +133,7 @@ impl<T> Tracker<T> for RawTracker<T> {
 
 #[cfg(test)]
 mod tests {
-        use super::*;
+    use super::*;
     use googletest::prelude::*;
 
     #[gtest]

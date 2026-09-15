@@ -52,7 +52,7 @@ impl<'a> CStrRef<'a> {
 
 #[cfg(test)]
 mod tests {
-        use super::*;
+    use super::*;
     use googletest::prelude::*;
 
     #[gtest]
