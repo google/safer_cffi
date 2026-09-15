@@ -61,14 +61,15 @@ See [`examples/raw_tracker/`](examples/raw_tracker/) for a full example.
 
 ## Struct Field Helpers
 
-### C Slices — `CBufPtr<T>`
+### C Slices — `CBufPtr<T>` and `OwnedCBufPtr<T>`
 
 Many C structs contain `(*mut T, L)` pairs representing dynamically-sized arrays
-(where `L` is an integer length type such as `c_int` or `usize`). `CBufPtr` can
-be used in place of `*mut T` and provides a safe handle for access and
-manipulation.
+(where `L` is an integer length type such as `c_int` or `usize`). `CBufPtr` and
+`OwnedCBufPtr` can be used in place of `*mut T` and provide safe handles for
+access and manipulation.
 
-*   **`CBufPtr<T, A = LibcAlloc>`**:
+*   **`CBufPtr<T, A = LibcAlloc>`**: Unowned buffer pointer wrapper
+    (`#[repr(transparent)]` around `*mut T`). Does not deallocate on drop.
 
     *   `with_len(len)` → `&[T]` — shared slice view for any `len: L` where `L:
         CBufLen`.
@@ -82,6 +83,22 @@ manipulation.
         an existing slice using `LibcAlloc`.
     *   `clone_and_leak_in(&[T], alloc)` → `CBufPtr<T, A>` — create a new
         CBufPtr by cloning an existing slice using a custom allocator.
+
+*   **`OwnedCBufPtr<T: Copy, A: DropByPtrAllocator = LibcAlloc>`**: RAII-owning
+    buffer pointer wrapper (`#[repr(transparent)]` around `*mut T`).
+    Automatically deallocates the underlying heap memory when dropped using
+    `A::deallocate_by_ptr` (e.g. `libc::free`). Because `T: Copy` (which implies
+    `!Drop`), elements do not require individual destruction, allowing the
+    buffer to be freed without tracking length at drop time. Dereferences
+    (`Deref`/`DerefMut`) to `CBufPtr<T, A>`, providing access to all `CBufPtr`
+    methods.
+
+    *   `null()` → `OwnedCBufPtr<T, A>` — create a null owned buffer pointer.
+    *   `from_raw(raw)` → `OwnedCBufPtr<T, A>` (unsafe) — construct from a raw
+        pointer, transferring ownership.
+    *   `into_c_buf_ptr(self)` → `CBufPtr<T, A>` — extract inner `CBufPtr`
+        without deallocating.
+    *   `into_raw(self)` → `*mut T` — extract raw pointer without deallocating.
 
 *   **`CVecRefMut<'a, T, L, A = LibcAlloc>`**: A borrowed mutable "vec-like"
     struct. Implements `DerefMut` to `&mut [T]`. Additional methods:
@@ -98,7 +115,7 @@ Usage example:
 #[repr(C)]
 struct MyStruct {
     // Safety invariant: the length of this array is `item_len`.
-    items: CBufPtr<Item>,
+    items: OwnedCBufPtr<Item>,
     item_len: c_int,
 }
 
@@ -116,15 +133,9 @@ impl MyStruct {
         unsafe { self.items.with_len_vec_mut(&mut self.item_len) }
     }
 }
-
-impl Drop for MyStruct {
-    fn drop(&mut self) {
-        self.items_vec_mut().clear();
-    }
-}
 ```
 
-See [`examples/c_slice_ptr/`](examples/c_slice_ptr/) for a full example.
+See [`examples/c_buf_ptr/`](examples/c_buf_ptr/) for a full example.
 
 ### C Strings — `CStrRef<'a>`
 
