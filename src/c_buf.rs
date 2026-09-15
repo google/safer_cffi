@@ -62,11 +62,15 @@
 //! // Mutate slice in place:
 //! my_struct.items_mut()[0] = 2.0;
 //!
-//! // Clone impl:
-//! let cloned_ptr: CBufPtr<f32> = CBufPtr::clone_and_leak(my_struct.items());
+//! // Clone impl: the clone is owned by the new struct, which must free it again.
+//! let mut cloned = MyStruct {
+//!     items: CBufPtr::clone_and_leak(my_struct.items()),
+//!     item_len: my_struct.item_len,
+//! };
 //!
 //! // Drop impl:
 //! my_struct.items_vec_mut().clear();
+//! cloned.items_vec_mut().clear();
 //! ```
 
 use crate::alloc::{DropByPtrAllocator, LibcAlloc};

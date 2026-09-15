@@ -62,10 +62,17 @@ impl<T> Handle<T> {
     }
 
     /// Converts the handle into a type-safe FFI pointer for C bridging.
+    ///
+    /// The returned pointer is an opaque token, not a real address: it carries no provenance
+    /// and must never be dereferenced. It can only be turned back into a [`Handle`].
     pub fn into_opaque_ptr(self) -> *mut T {
         // Do not implement From<Handle<T>> for *mut T, we want to force the conversion to be
         // explicit because it's not a normal but an opaque pointer.
-        self.id as *mut T
+        //
+        // We deliberately use `without_provenance_mut` rather than an `as` cast: the id is not
+        // derived from any allocation, so fabricating provenance would be wrong (and is rejected
+        // by Miri's strict provenance mode).
+        core::ptr::without_provenance_mut(self.id)
     }
 }
 

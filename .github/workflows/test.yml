@@ -21,3 +21,22 @@ jobs:
       with:
         persist-credentials: false
     - run: cargo test --locked
+
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      with:
+        persist-credentials: false
+    # `--allow-downgrade` picks the most recent nightly that actually shipped a Miri component.
+    - run: rustup toolchain install nightly --profile minimal --component miri --allow-downgrade
+    # Stacked Borrows and Tree Borrows are two different aliasing models; code accepted by
+    # one is not necessarily accepted by the other, so we check against both.
+    - name: Miri (Stacked Borrows)
+      run: cargo +nightly miri test --locked
+      env:
+        MIRIFLAGS: -Zmiri-strict-provenance
+    - name: Miri (Tree Borrows)
+      run: cargo +nightly miri test --locked
+      env:
+        MIRIFLAGS: -Zmiri-strict-provenance -Zmiri-tree-borrows
