@@ -73,6 +73,7 @@ use crate::alloc::{DropByPtrAllocator, LibcAlloc};
 use crate::c_vec::CVecRefMut;
 use crate::errors::AllocError;
 use allocator_api2::alloc::{Allocator, Layout};
+use core::fmt;
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 use core::ptr::{self, NonNull};
@@ -116,34 +117,73 @@ pub(crate) const fn max_slice_len<T>() -> usize {
 ///    via `TryInto<usize>` (returning `Err`).
 /// 4. **No Interior Mutability**: `Self` must not use interior mutability (`Cell`, `UnsafeCell`,
 ///    `Atomic*`, etc.) to change its conversion output over time.
+/// 5. **Maximum Value**: `Self::MAX` must be the maximum value representable by `Self` as
+///    a non-negative `usize`, such that `Self::try_from(Self::MAX)` succeeds and round-trips.
+///    For any `n: usize > Self::MAX`, `Self::try_from(n)` must return `Err`.
 pub unsafe trait CBufLen:
-    Copy + TryInto<usize> + TryFrom<usize> + Default + 'static
+    Copy
+    + TryInto<usize, Error: core::error::Error>
+    + TryFrom<usize, Error: core::error::Error>
+    + Default
+    + 'static
 {
+    /// The maximum value representable by this length type as a non-negative `usize`.
+    const MAX: usize;
 }
 
 // SAFETY: Primitive unsigned integer types satisfy purity, determinism,
-// and round-trip conversion to/from `usize` within their representable ranges.
-unsafe impl CBufLen for usize {}
+// and round-trip conversion to/from `usize` within their representable ranges,
+// with `MAX` set to the maximum value representable as a `usize`.
+unsafe impl CBufLen for usize {
+    const MAX: usize = usize::MAX;
+}
 // SAFETY: see usize
-unsafe impl CBufLen for u8 {}
+unsafe impl CBufLen for u8 {
+    const MAX: usize = u8::MAX as usize;
+}
 // SAFETY: see usize
-unsafe impl CBufLen for u16 {}
+unsafe impl CBufLen for u16 {
+    const MAX: usize = u16::MAX as usize;
+}
 // SAFETY: see usize
-unsafe impl CBufLen for u32 {}
+unsafe impl CBufLen for u32 {
+    const MAX: usize = const_min_u128(u32::MAX as u128, usize::MAX as u128) as usize;
+}
 // SAFETY: see usize
-unsafe impl CBufLen for u64 {}
+unsafe impl CBufLen for u64 {
+    const MAX: usize = const_min_u128(u64::MAX as u128, usize::MAX as u128) as usize;
+}
 
 // SAFETY: Primitive signed integer types satisfy purity, determinism,
-// and correctly fail conversion via `TryInto<usize>` on negative values.
-unsafe impl CBufLen for isize {}
+// and correctly fail conversion via `TryInto<usize>` on negative values,
+// with `MAX` set to the maximum value representable as a `usize`.
+unsafe impl CBufLen for isize {
+    const MAX: usize = isize::MAX as usize;
+}
 // SAFETY: see isize
-unsafe impl CBufLen for i8 {}
+unsafe impl CBufLen for i8 {
+    const MAX: usize = i8::MAX as usize;
+}
 // SAFETY: see isize
-unsafe impl CBufLen for i16 {}
+unsafe impl CBufLen for i16 {
+    const MAX: usize = i16::MAX as usize;
+}
 // SAFETY: see isize
-unsafe impl CBufLen for i32 {}
+unsafe impl CBufLen for i32 {
+    const MAX: usize = const_min_u128(i32::MAX as u128, usize::MAX as u128) as usize;
+}
 // SAFETY: see isize
-unsafe impl CBufLen for i64 {}
+unsafe impl CBufLen for i64 {
+    const MAX: usize = const_min_u128(i64::MAX as u128, usize::MAX as u128) as usize;
+}
+
+const fn const_min_u128(a: u128, b: u128) -> u128 {
+    if a < b {
+        a
+    } else {
+        b
+    }
+}
 
 // ---------------------------------------------------------------------------
 //  CBufPtr — repr(transparent) wrapper around *mut T
@@ -269,14 +309,14 @@ impl<T, A: Allocator> CBufPtr<T, A> {
     ///
     /// # Safety
     ///
-    /// The caller must ensure that:
-    /// - `len` reflects the exact number of initialized elements pointed to by `self.ptr` (or 0 if empty).
+    /// - `len` is the number of initialized elements pointed to by `self.ptr` (or 0 if empty).
     /// - The instance of `A` passed to this function MUST BE the same instance that was used for
     ///   allocation of `self`.
     ///
     /// # Panics
     ///
-    /// Panics if `*len` is negative or exceeds the maximum safe slice length.
+    /// Panics if `*len` is negative, exceeds the maximum safe slice length, or if
+    /// `self.ptr` is null and `*len > 0`.
     pub unsafe fn as_vec_mut_in<'a, L: CBufLen>(
         &'a mut self,
         len: &'a mut L,
@@ -289,11 +329,60 @@ impl<T, A: Allocator> CBufPtr<T, A> {
             slice_len <= max_slice_len::<T>(),
             "CBufPtr: len {slice_len} exceeds maximum safe slice length"
         );
-        // SAFETY: The caller guarantees the pointer/len invariant, allocator compatibility,
-        // validity to deallocate/reallocate, and absence of aliases.
+        assert!(
+            !self.ptr.is_null() || slice_len == 0,
+            "CBufPtr: null pointer with non-zero length {slice_len}"
+        );
+        // SAFETY: The caller guarantees the pointer/len/cap invariants and allocator compatibility.
         // `&mut self` ties the lifetime of the returned `CVecRefMut` to the exclusive borrow,
         // preventing aliasing through `self`.
-        CVecRefMut { ptr: self, len, alloc }
+        CVecRefMut { ptr: self, len, capacity: None, alloc }
+    }
+
+    /// Create a capacity-tracking mutable vector handle with a custom [`Allocator`].
+    ///
+    /// Unlike [`as_vec_mut_in`](Self::as_vec_mut_in), the returned [`CVecRefMut`] also
+    /// borrows a separate `cap` field describing how many elements the allocation can
+    /// hold. This lets [`push_back`](CVecRefMut::push_back) append into spare capacity
+    /// without reallocating and grow geometrically once full, saving reallocations.
+    ///
+    /// # Safety
+    ///
+    /// - `*cap` is the number of elements the allocation pointed to by
+    ///   `self.ptr` can hold (or 0 if `self.ptr` is null).
+    /// - `*len` is the number of initialized elements, and `*len <= *cap`.
+    /// - The instance of `A` passed to this function MUST BE the same instance that was
+    ///   used for allocation of `self`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `*len` or `*cap` is negative, if `*cap` exceeds the maximum safe slice
+    /// length, if `*len > *cap`, or if `self.ptr` is null and `*cap > 0`.
+    pub unsafe fn as_vec_mut_with_cap_in<'a, L: CBufLen, C: CBufLen>(
+        &'a mut self,
+        len: &'a mut L,
+        cap: &'a mut C,
+        alloc: A,
+    ) -> CVecRefMut<'a, T, L, A, C> {
+        let Ok(slice_len): Result<usize, _> = (*len).try_into() else {
+            panic!("CBufPtr: len is negative");
+        };
+        let Ok(slice_cap): Result<usize, _> = (*cap).try_into() else {
+            panic!("CBufPtr: cap is negative");
+        };
+        assert!(
+            slice_cap <= max_slice_len::<T>(),
+            "CBufPtr: cap {slice_cap} exceeds maximum safe slice length"
+        );
+        assert!(slice_len <= slice_cap, "CBufPtr: len {slice_len} exceeds cap {slice_cap}");
+        assert!(
+            !self.ptr.is_null() || (slice_cap == 0 && slice_len == 0),
+            "CBufPtr: null pointer with non-zero capacity {slice_cap}"
+        );
+        // SAFETY: The caller guarantees the pointer/len/cap invariants and allocator compatibility.
+        // `&mut self` ties the lifetime of the returned `CVecRefMut` to the exclusive borrow,
+        // preventing aliasing through `self`.
+        CVecRefMut { ptr: self, len, capacity: Some(cap), alloc }
     }
 
     /// Clone the contents of a Rust slice into a new C-allocated buffer using a custom [`Allocator`].
@@ -400,8 +489,8 @@ impl<T> CBufPtr<T, LibcAlloc> {
     ///
     /// # Safety
     ///
-    /// The caller must ensure that:
-    /// - `len` reflects the exact number of initialized elements pointed to by `self.ptr` (or 0 if empty).
+    /// - This pointer is tracked with length only (no capacity).
+    /// - `len` is the number of initialized elements pointed to by `self.ptr` (or 0 if empty).
     ///
     /// # Panics
     ///
@@ -410,10 +499,40 @@ impl<T> CBufPtr<T, LibcAlloc> {
         &'a mut self,
         len: &'a mut L,
     ) -> CVecRefMut<'a, T, L, LibcAlloc> {
-        // SAFETY: The caller guarantees `len` is the exact length and no active aliases exist.
-        // Compatibility with `LibcAlloc` is an invariant of `CBufPtr<T, LibcAlloc>` and the
-        // fact that all instances of LibcAlloc are equivalent.
+        // SAFETY: The caller upholds this function's `# Safety` contract, which matches
+        // that of `as_vec_mut_in`.
+        // The only additional requirement is allocator compatibility, which is an invariant of
+        // `CBufPtr<T, LibcAlloc>` and the fact that all instances of `LibcAlloc` are equivalent.
         unsafe { self.as_vec_mut_in(len, LibcAlloc) }
+    }
+
+    /// Create a capacity-tracking mutable vector handle backed by [`LibcAlloc`].
+    ///
+    /// Like [`as_vec_mut`](Self::as_vec_mut), but also borrows a separate `cap` field so
+    /// that [`push_back`](CVecRefMut::push_back) can append into spare capacity without
+    /// reallocating and grow geometrically once full, saving reallocations.
+    ///
+    /// # Safety
+    ///
+    /// - This pointer is tracked with length and capacity.
+    /// - `*cap` is the number of elements the allocation pointed to by
+    ///   `self.ptr` can hold (or 0 if `self.ptr` is null).
+    /// - `*len` is the number of initialized elements, and `*len <= *cap`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `*len` or `*cap` is negative, if `*cap` exceeds the maximum safe slice
+    /// length, or if `*len > *cap`.
+    pub unsafe fn as_vec_mut_with_cap<'a, L: CBufLen, C: CBufLen>(
+        &'a mut self,
+        len: &'a mut L,
+        cap: &'a mut C,
+    ) -> CVecRefMut<'a, T, L, LibcAlloc, C> {
+        // SAFETY: The caller upholds this function's `# Safety` contract, which matches
+        // that of `as_vec_mut_with_cap_in`.
+        // The only additional requirement is allocator compatibility, which is an invariant of
+        // `CBufPtr<T, LibcAlloc>` and the fact that all instances of `LibcAlloc` are equivalent.
+        unsafe { self.as_vec_mut_with_cap_in(len, cap, LibcAlloc) }
     }
 
     /// Clone the contents of a Rust slice into a new C-allocated buffer using [`LibcAlloc`].
@@ -443,8 +562,8 @@ impl<T> CBufPtr<T, LibcAlloc> {
 // SAFETY: `CBufPtr` is an owning pointer, so it is `Send` if `T` is `Send`.
 unsafe impl<T: Send, A> Send for CBufPtr<T, A> {}
 
-impl<T, A> core::fmt::Debug for CBufPtr<T, A> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl<T, A> fmt::Debug for CBufPtr<T, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("CBufPtr").field(&self.ptr).finish()
     }
 }
@@ -789,6 +908,14 @@ mod tests {
         let _ = unsafe { ptr.as_vec_mut(&mut count) };
     }
 
+    #[gtest]
+    #[should_panic(expected = "CBufPtr: null pointer with non-zero length 5")]
+    fn c_buf_ptr_as_vec_mut_null_ptr_non_zero_len() {
+        let mut ptr = CBufPtr::<i32>::null();
+        let mut count: c_int = 5;
+        let _ = unsafe { ptr.as_vec_mut(&mut count) };
+    }
+
     // -----------------------------------------------------------------------
     //  OwnedCBufPtr tests
     // -----------------------------------------------------------------------
@@ -920,5 +1047,29 @@ mod tests {
         let owned3 = unsafe { OwnedCBufPtr::<i32, GlobalTrackingAlloc>::from_raw(raw) };
         drop(owned3);
         assert_that!(GLOBAL_DEALLOC_COUNT.load(Ordering::SeqCst), eq(1));
+    }
+
+    #[gtest]
+    fn c_buf_len_max_roundtrips_and_overflow_fails() {
+        fn check<T: CBufLen>() {
+            let max = T::MAX;
+            let val = T::try_from(max).expect("T::try_from(T::MAX) must succeed");
+            let roundtrip: usize = val.try_into().expect("T.try_into() must succeed");
+            assert_that!(roundtrip, eq(max));
+            if max < usize::MAX {
+                assert!(T::try_from(max + 1).is_err());
+            }
+        }
+
+        check::<usize>();
+        check::<u8>();
+        check::<u16>();
+        check::<u32>();
+        check::<u64>();
+        check::<isize>();
+        check::<i8>();
+        check::<i16>();
+        check::<i32>();
+        check::<i64>();
     }
 }

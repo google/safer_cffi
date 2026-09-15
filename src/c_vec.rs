@@ -18,6 +18,22 @@ use crate::c_buf::{max_slice_len, CBufLen, CBufPtr};
 use allocator_api2::alloc::{Allocator, Layout};
 use core::ptr::{self, NonNull};
 
+/// The minimum non-zero capacity to allocate when a capacity-tracking vector
+/// first grows from empty.
+///
+/// This mirrors the amortisation strategy of the standard library's `Vec`,
+/// avoiding a burst of tiny reallocations for small element types while not
+/// over-allocating for large ones.
+const fn min_non_zero_cap<T>() -> usize {
+    if core::mem::size_of::<T>() == 1 {
+        8
+    } else if core::mem::size_of::<T>() <= 1024 {
+        4
+    } else {
+        1
+    }
+}
+
 // ---------------------------------------------------------------------------
 //  CVecRefMut — mutable vector handle
 // ---------------------------------------------------------------------------
@@ -32,21 +48,39 @@ use core::ptr::{self, NonNull};
 /// [`DerefMut`](core::ops::DerefMut), which correctly tie the returned
 /// slice's lifetime to the borrow of this handle.
 ///
+/// # Capacity
+///
+/// A handle may optionally track a separate *capacity* — the number of elements
+/// the allocation can hold. Such a handle is created via [`CBufPtr::as_vec_mut_with_cap`] or
+/// [`CBufPtr::as_vec_mut_with_cap_in`]. When capacity is tracked,
+/// [`push_back`](Self::push_back) appends into spare capacity without reallocating
+/// and grows geometrically once full, matching `Vec`'s amortised behaviour. When
+/// capacity is not tracked (the default), the allocation always holds exactly `len`
+/// elements and every push reallocates.
+///
 /// # Safety Invariant
 ///
-/// If `len > 0`, it is the length of array `ptr`, and must be <= `isize::MAX`.
-/// If `len == 0`, the array is empty.
-pub struct CVecRefMut<'a, T, L: CBufLen, A: Allocator = LibcAlloc> {
+/// - Let `cap` be the tracked capacity if present, or `len` otherwise. If `cap > 0`,
+///   `ptr` is non-null and points to an allocation of exactly `cap` elements of `T`
+///   (allocated by `A`), and `cap <= isize::MAX / size_of::<T>()`.
+/// - `len` is the number of initialised, leading elements and satisfies `len <= cap`.
+///   If `len == 0`, no element is initialised.
+/// - `alloc` is the allocator used for all allocations.
+/// - `capacity` is `Some` if and only if this handle tracks capacity.
+pub struct CVecRefMut<'a, T, L: CBufLen, A: Allocator = LibcAlloc, C: CBufLen = L> {
     pub(crate) ptr: &'a mut CBufPtr<T, A>,
     pub(crate) len: &'a mut L,
+    /// Optional capacity field. When `Some`, the allocation holds `*capacity`
+    /// elements; when `None`, the allocation holds exactly `*len` elements.
+    pub(crate) capacity: Option<&'a mut C>,
     pub(crate) alloc: A,
 }
 
-impl<'a, T, L: CBufLen, A: Allocator> CVecRefMut<'a, T, L, A> {
+impl<'a, T, L: CBufLen, A: Allocator, C: CBufLen> CVecRefMut<'a, T, L, A, C> {
     /// Return the slice view with the lifetime tied to the borrow.
     #[inline]
     pub fn as_slice(&self) -> &[T] {
-        let len = (*self.len).try_into().unwrap_or(0);
+        let len = self.len();
         if self.ptr.is_null() || len == 0 {
             return &[];
         }
@@ -64,7 +98,7 @@ impl<'a, T, L: CBufLen, A: Allocator> CVecRefMut<'a, T, L, A> {
     /// Return the mutable slice view with the lifetime tied to the borrow.
     #[inline]
     pub fn as_slice_mut(&mut self) -> &mut [T] {
-        let len = (*self.len).try_into().unwrap_or(0);
+        let len = self.len();
         if self.ptr.is_null() || len == 0 {
             return &mut [];
         }
@@ -88,7 +122,7 @@ impl<'a, T, L: CBufLen, A: Allocator> CVecRefMut<'a, T, L, A> {
     /// Return the number of elements in the vector.
     #[inline]
     pub fn len(&self) -> usize {
-        (*self.len).try_into().unwrap_or(0)
+        (*self.len).try_into().expect("CVecRefMut: len is negative")
     }
 
     /// Return `true` if the vector contains no elements.
@@ -97,12 +131,26 @@ impl<'a, T, L: CBufLen, A: Allocator> CVecRefMut<'a, T, L, A> {
         self.len() == 0
     }
 
-    /// Append an element, reallocating via the configured [`Allocator`] to grow by one slot.
+    /// Return the number of elements the allocation can hold without reallocating,
+    /// or `None` if this handle does not track capacity separately from length.
     ///
-    /// Returns `Err(value)` if the array cannot grow (out of memory or `len`
+    /// When `None`, the allocation always holds exactly [`len`](Self::len) elements.
+    #[inline]
+    pub fn capacity(&self) -> Option<usize> {
+        self.capacity.as_ref().map(|c| (**c).try_into().expect("CVecRefMut: capacity is negative"))
+    }
+
+    /// Append an element.
+    ///
+    /// If this handle [tracks capacity](Self::capacity) and spare capacity is
+    /// available, the element is written in place without reallocating. Otherwise
+    /// the buffer is reallocated via the configured [`Allocator`]: geometrically
+    /// (roughly doubling) when tracking capacity, or by exactly one slot when not.
+    ///
+    /// Returns `Err(value)` if the array cannot grow (out of memory, or `len`/`cap`
     /// overflow), giving the caller the element back.
     pub fn try_push_back(&mut self, value: T) -> Result<(), T> {
-        let old_len = (*self.len).try_into().unwrap_or(0);
+        let old_len = self.len();
         let Some(new_len) = old_len.checked_add(1).filter(|&n| n <= max_slice_len::<T>()) else {
             core::hint::cold_path();
             return Err(value);
@@ -112,44 +160,76 @@ impl<'a, T, L: CBufLen, A: Allocator> CVecRefMut<'a, T, L, A> {
             return Err(value);
         };
 
-        // Cannot overflow: `new_len <= max_slice_len::<T>()` guarantees
-        // `new_len * size_of::<T>() <= isize::MAX`.
-        let Ok(old_layout) = Layout::array::<T>(old_len.max(1)) else {
-            core::hint::cold_path();
-            return Err(value);
-        };
-        let Ok(new_layout) = Layout::array::<T>(new_len) else {
-            core::hint::cold_path();
-            return Err(value);
-        };
+        // Currently allocated capacity. When capacity is not tracked, the
+        // allocation holds exactly `old_len` elements.
+        let old_cap = self.capacity();
 
-        let result = match NonNull::new(self.ptr.as_ptr() as *mut u8) {
-            // SAFETY: If `*self.ptr` is non-null, it was allocated by `self.alloc` with `old_layout`.
-            Some(old_ptr) => unsafe { self.alloc.grow(old_ptr, old_layout, new_layout) },
-            None => self.alloc.allocate(new_layout),
-        };
-        let Ok(new_slice) = result else {
-            core::hint::cold_path();
-            return Err(value);
-        };
-        let new_ptr = new_slice.as_ptr() as *mut T;
+        if old_cap.is_none_or(|cap| cap == old_len) {
+            // Slow path: (re)allocate. Grow geometrically when tracking capacity to
+            // amortise future pushes; otherwise grow by exactly one slot.
+            let mut new_cap = match old_cap {
+                Some(0) => min_non_zero_cap::<T>(),
+                // This is guaranteed to increase capacity at least by 1 because we already
+                // asserted that old_len < max_slice_len::<T>() and that old_len == old_cap.
+                Some(cap) => cap.saturating_mul(2).min(max_slice_len::<T>()),
+                None => new_len,
+            };
+            let new_cap_val = match C::try_from(new_cap) {
+                Ok(val) => val,
+                Err(_) => {
+                    core::hint::cold_path();
+                    if new_len > C::MAX {
+                        // Cannot represent the new length in `capacity`, so we cannot grow.
+                        return Err(value);
+                    } else {
+                        // We cannot represent old_cap * 2, but new_len is representable.
+                        // Reduce cap to the maximum representable value.
+                        new_cap = C::MAX;
+                        C::try_from(C::MAX).unwrap()
+                    }
+                }
+            };
 
-        // SAFETY: `new_ptr` has room for `new_len` elements; the first
-        // `old_len` are already initialised. We write one more at the end.
-        unsafe { ptr::write(new_ptr.add(old_len), value) };
+            let Ok(new_layout) = Layout::array::<T>(new_cap) else {
+                core::hint::cold_path();
+                return Err(value);
+            };
+            let Ok(old_layout) = Layout::array::<T>(old_cap.unwrap_or(old_len).max(1)) else {
+                core::hint::cold_path();
+                return Err(value);
+            };
 
-        // SAFETY: `new_ptr` was allocated via the configured allocator, points to an array of
-        // `T` and is aligned.
-        let p = unsafe { CBufPtr::from_raw(new_ptr) };
-        *self.ptr = p;
+            let alloc_result = match NonNull::new(self.ptr.as_ptr() as *mut u8) {
+                // SAFETY: If `old_ptr` is non-null, it was allocated by `self.alloc` with
+                // `old_layout` (`old_cap` elements, or `old_len` when capacity is untracked).
+                Some(old_ptr) => unsafe { self.alloc.grow(old_ptr, old_layout, new_layout) },
+                None => self.alloc.allocate(new_layout),
+            };
+            let Ok(new_ptr) = alloc_result else {
+                core::hint::cold_path();
+                return Err(value);
+            };
+            // SAFETY: `new_ptr` is non-null and points to an allocation of `new_cap`
+            // elements of `T`.
+            *self.ptr = unsafe { CBufPtr::from_raw(new_ptr.as_ptr() as *mut T) };
+            if let Some(cap) = self.capacity.as_deref_mut() {
+                *cap = new_cap_val;
+            }
+        }
+
+        // SAFETY: By the safety invariant of `CVecRefMut` the allocation is correctly aligned and
+        // has room for at least `new_len` elements, i.e. it is valid to write to index `old_len`.
+        unsafe { ptr::write(self.ptr.as_ptr().add(old_len), value) };
         *self.len = new_len_val;
         Ok(())
     }
 
-    /// Append an element, reallocating via the configured [`Allocator`] to grow by one slot.
+    /// Append an element, growing the allocation if necessary.
+    ///
+    /// See [`try_push_back`](Self::try_push_back) for the growth strategy.
     ///
     /// # Panics
-    /// Panics if the array cannot grow (out of memory or `len` overflow).
+    /// Panics if the array cannot grow (out of memory, or `len`/`cap` overflow).
     pub fn push_back(&mut self, value: T) {
         if self.try_push_back(value).is_err() {
             core::hint::cold_path();
@@ -159,16 +239,19 @@ impl<'a, T, L: CBufLen, A: Allocator> CVecRefMut<'a, T, L, A> {
 
     /// Drop all elements and deallocate the buffer using the configured [`Allocator`].
     pub fn clear(&mut self) {
-        let len = (*self.len).try_into().unwrap_or(0);
-        // We replace the pointer and length first to leave the handle in a valid, empty
+        let len = self.len();
+        // The allocation spans `capacity` elements when tracked, otherwise exactly `len`.
+        let cap = self.capacity().unwrap_or(len);
+        // We replace the pointer and lengths first to leave the handle in a valid, empty
         // state immediately. This is necessary for panic safety: if dropping elements
         // panics, the handle won't point to invalid memory.
         let old_ptr = core::mem::replace(self.ptr, CBufPtr::null());
         *self.len = L::default();
+        if let Some(cap_ref) = self.capacity.as_deref_mut() {
+            *cap_ref = C::default();
+        }
 
-        if !old_ptr.is_null()
-            && let Some(non_null) = NonNull::new(old_ptr.as_ptr() as *mut u8)
-        {
+        if let Some(non_null) = NonNull::new(old_ptr.as_ptr() as *mut u8) {
             // We use a local Drop guard to guarantee that deallocation is called
             // even if `ptr::drop_in_place` panics while dropping the elements.
             // This prevents leaking the underlying allocation.
@@ -183,7 +266,9 @@ impl<'a, T, L: CBufLen, A: Allocator> CVecRefMut<'a, T, L, A> {
                     unsafe { self.alloc.deallocate(self.ptr, self.layout) };
                 }
             }
-            let layout = Layout::array::<T>(len.max(1)).expect("CVecRefMut: valid layout");
+            // The allocation covers `cap` elements, so it must be freed with a
+            // `cap`-sized layout (which equals `len` when capacity is not tracked).
+            let layout = Layout::array::<T>(cap.max(1)).expect("CVecRefMut: valid layout");
             let _guard = AllocDropGuard { alloc: &self.alloc, ptr: non_null, layout };
 
             if len > 0 {
@@ -198,19 +283,28 @@ impl<'a, T, L: CBufLen, A: Allocator> CVecRefMut<'a, T, L, A> {
     }
 }
 
-impl<'a, T, L: CBufLen, A: Allocator + PartialEq> CVecRefMut<'a, T, L, A> {
-    /// Swap the underlying pointer and len with another handle that uses the same allocator.
+impl<'a, T, L: CBufLen, A: Allocator + PartialEq, C: CBufLen> CVecRefMut<'a, T, L, A, C> {
+    /// Swap the underlying pointer, len, and capacity with another handle that uses
+    /// the same allocator.
     ///
     /// # Panics
-    /// Panics if `self` and `other` do not share the same allocator instance.
-    pub fn swap(&mut self, other: &mut CVecRefMut<'_, T, L, A>) {
+    /// Panics if `self` and `other` do not share the same allocator instance, or if
+    /// exactly one of the two handles tracks capacity (both must track capacity, or
+    /// neither).
+    pub fn swap(&mut self, other: &mut CVecRefMut<'_, T, L, A, C>) {
         assert!(self.alloc == other.alloc, "CVecRefMut::swap: handles must use the same allocator");
+        // panic safety: swap capacity first so that we don't panic after swapping pointers.
+        match (self.capacity.as_deref_mut(), other.capacity.as_deref_mut()) {
+            (Some(a), Some(b)) => core::mem::swap(a, b),
+            (None, None) => {}
+            _ => panic!("CVecRefMut::swap: both handles must track capacity, or neither"),
+        }
         core::mem::swap(self.ptr, other.ptr);
         core::mem::swap(self.len, other.len);
     }
 }
 
-impl<T, L: CBufLen, A: Allocator> core::ops::Deref for CVecRefMut<'_, T, L, A> {
+impl<T, L: CBufLen, A: Allocator, C: CBufLen> core::ops::Deref for CVecRefMut<'_, T, L, A, C> {
     type Target = [T];
 
     #[inline]
@@ -219,14 +313,16 @@ impl<T, L: CBufLen, A: Allocator> core::ops::Deref for CVecRefMut<'_, T, L, A> {
     }
 }
 
-impl<T, L: CBufLen, A: Allocator> core::ops::DerefMut for CVecRefMut<'_, T, L, A> {
+impl<T, L: CBufLen, A: Allocator, C: CBufLen> core::ops::DerefMut for CVecRefMut<'_, T, L, A, C> {
     #[inline]
     fn deref_mut(&mut self) -> &mut [T] {
         self.as_slice_mut()
     }
 }
 
-impl<T: core::fmt::Debug, L: CBufLen, A: Allocator> core::fmt::Debug for CVecRefMut<'_, T, L, A> {
+impl<T: core::fmt::Debug, L: CBufLen, A: Allocator, C: CBufLen> core::fmt::Debug
+    for CVecRefMut<'_, T, L, A, C>
+{
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         core::fmt::Debug::fmt(self.as_slice(), f)
     }
@@ -378,7 +474,8 @@ mod tests {
 
     #[gtest]
     fn c_vec_ref_mut_try_push_back_overflow() {
-        let mut ptr = CBufPtr::<i32>::null();
+        let mut dummy = 0i32;
+        let mut ptr = unsafe { CBufPtr::from_raw(&mut dummy) };
         let mut len: c_int = c_int::MAX;
         let mut handle = unsafe { ptr.as_vec_mut(&mut len) };
         let result = handle.try_push_back(999);
@@ -538,10 +635,293 @@ mod tests {
     #[gtest]
     fn c_vec_ref_mut_u8_overflow() {
         let mut ptr = CBufPtr::<i32>::null();
-        let mut len: u8 = u8::MAX;
-        let mut handle = unsafe { ptr.as_vec_mut(&mut len) };
-        let result = handle.try_push_back(999);
-        assert!(result.is_err());
-        assert_that!(result.unwrap_err(), eq(999));
+        let mut len: u8 = 0;
+        {
+            let mut handle = unsafe { ptr.as_vec_mut(&mut len) };
+            for i in 0..=254 {
+                assert!(handle.try_push_back(i as i32).is_ok());
+            }
+            assert_that!(handle.len(), eq(255));
+
+            let result = handle.try_push_back(999);
+            assert!(result.is_err());
+            assert_that!(result.unwrap_err(), eq(999));
+            handle.clear();
+        }
+        assert!(ptr.is_null());
+        assert_that!(len, eq(0));
+    }
+
+    // -----------------------------------------------------------------------
+    //  Capacity-tracking (as_vec_mut_with_cap) tests
+    // -----------------------------------------------------------------------
+
+    #[gtest]
+    fn c_vec_ref_mut_with_cap_reuses_spare_capacity() {
+        let alloc = TrackingAlloc::default();
+        let mut ptr = CBufPtr::null();
+        let mut len: c_int = 0;
+        let mut cap: c_int = 0;
+        {
+            // SAFETY: null pointer with len 0 and cap 0 is safe.
+            let mut handle = unsafe { ptr.as_vec_mut_with_cap_in(&mut len, &mut cap, &alloc) };
+
+            // First push allocates a buffer with `min_non_zero_cap::<i32>() == 4` slots.
+            handle.push_back(1);
+            assert_that!(alloc.alloc_count.load(Ordering::SeqCst), eq(1));
+            assert_that!(alloc.grow_count.load(Ordering::SeqCst), eq(0));
+            assert_that!(handle.capacity(), some(eq(4)));
+
+            // The next three pushes reuse spare capacity: no allocations at all.
+            handle.push_back(2);
+            handle.push_back(3);
+            handle.push_back(4);
+            assert_that!(alloc.alloc_count.load(Ordering::SeqCst), eq(1));
+            assert_that!(alloc.grow_count.load(Ordering::SeqCst), eq(0));
+            assert_that!(handle.len(), eq(4));
+            assert_that!(handle.capacity(), some(eq(4)));
+
+            // The fifth push is full, so it grows geometrically to 8.
+            handle.push_back(5);
+            assert_that!(alloc.grow_count.load(Ordering::SeqCst), eq(1));
+            assert_that!(handle.capacity(), some(eq(8)));
+            assert_that!(&*handle, container_eq([1, 2, 3, 4, 5]));
+
+            handle.clear();
+            assert_that!(alloc.dealloc_count.load(Ordering::SeqCst), eq(1));
+        }
+        assert!(ptr.is_null());
+        assert_that!(len, eq(0));
+        assert_that!(cap, eq(0));
+    }
+
+    #[gtest]
+    fn c_vec_ref_mut_with_cap_distinct_length_types() {
+        // The capacity field may use a different integer type than the length field.
+        let mut ptr = CBufPtr::<i32>::null();
+        let mut len: c_int = 0;
+        let mut cap: usize = 0;
+        {
+            let mut handle = unsafe { ptr.as_vec_mut_with_cap(&mut len, &mut cap) };
+            handle.push_back(10);
+            handle.push_back(20);
+            assert_that!(&*handle, container_eq([10, 20]));
+            handle.clear();
+        }
+        assert!(ptr.is_null());
+        assert_that!(len, eq(0));
+        assert_that!(cap, eq(0usize));
+    }
+
+    #[gtest]
+    fn c_vec_ref_mut_with_cap_existing_spare_buffer() {
+        // Simulate a C struct with a buffer that already has spare capacity.
+        let alloc = TrackingAlloc::default();
+        let slice = (&alloc).allocate(Layout::array::<i32>(4).unwrap()).unwrap();
+        let raw = slice.as_ptr() as *mut i32;
+        // Initialise the first two elements.
+        unsafe {
+            ptr::write(raw, 1);
+            ptr::write(raw.add(1), 2);
+        }
+        // SAFETY: `raw` was allocated by `alloc` for 4 i32s.
+        let mut ptr = unsafe { CBufPtr::from_raw(raw) };
+        let mut len: c_int = 2;
+        let mut cap: c_int = 4;
+        {
+            // SAFETY: ptr holds 4 slots, 2 initialised, allocated via `alloc`.
+            let mut handle = unsafe { ptr.as_vec_mut_with_cap_in(&mut len, &mut cap, &alloc) };
+            assert_that!(alloc.alloc_count.load(Ordering::SeqCst), eq(1));
+
+            // Pushing into spare capacity must not reallocate.
+            handle.push_back(3);
+            handle.push_back(4);
+            assert_that!(alloc.alloc_count.load(Ordering::SeqCst), eq(1));
+            assert_that!(alloc.grow_count.load(Ordering::SeqCst), eq(0));
+            assert_that!(&*handle, container_eq([1, 2, 3, 4]));
+
+            handle.clear();
+            assert_that!(alloc.dealloc_count.load(Ordering::SeqCst), eq(1));
+        }
+        assert!(ptr.is_null());
+        assert_that!(len, eq(0));
+        assert_that!(cap, eq(0));
+    }
+
+    #[gtest]
+    fn c_vec_ref_mut_without_cap_reports_no_capacity() {
+        let mut ptr = CBufPtr::<i32>::null();
+        let mut len: c_int = 0;
+        let handle = unsafe { ptr.as_vec_mut(&mut len) };
+        assert_that!(handle.capacity(), none());
+    }
+
+    #[gtest]
+    #[should_panic(expected = "CBufPtr: len 3 exceeds cap 2")]
+    fn c_vec_ref_mut_with_cap_len_exceeds_cap_panics() {
+        let mut ptr = CBufPtr::<i32>::null();
+        let mut len: c_int = 3;
+        let mut cap: c_int = 2;
+        let _ = unsafe { ptr.as_vec_mut_with_cap(&mut len, &mut cap) };
+    }
+
+    #[gtest]
+    #[should_panic(expected = "CBufPtr: cap is negative")]
+    fn c_vec_ref_mut_with_cap_negative_cap_panics() {
+        let mut ptr = CBufPtr::<i32>::null();
+        let mut len: c_int = 0;
+        let mut cap: c_int = -1;
+        let _ = unsafe { ptr.as_vec_mut_with_cap(&mut len, &mut cap) };
+    }
+
+    #[gtest]
+    #[should_panic(expected = "CBufPtr: null pointer with non-zero capacity 5")]
+    fn c_vec_ref_mut_with_cap_null_ptr_non_zero_cap_panics() {
+        let mut ptr = CBufPtr::<i32>::null();
+        let mut len: c_int = 0;
+        let mut cap: c_int = 5;
+        let _ = unsafe { ptr.as_vec_mut_with_cap(&mut len, &mut cap) };
+    }
+
+    #[gtest]
+    #[should_panic(expected = "CBufPtr: null pointer with non-zero length 5")]
+    fn c_vec_ref_mut_null_ptr_non_zero_len_panics() {
+        let mut ptr = CBufPtr::<i32>::null();
+        let mut len: c_int = 5;
+        let _ = unsafe { ptr.as_vec_mut(&mut len) };
+    }
+
+    #[gtest]
+    fn c_vec_ref_mut_with_cap_clear_drops_elements() {
+        static DROPPED: AtomicU8 = AtomicU8::new(0);
+        struct Foo(u8);
+        impl Drop for Foo {
+            fn drop(&mut self) {
+                DROPPED.fetch_add(self.0, Ordering::Relaxed);
+            }
+        }
+
+        let mut ptr = CBufPtr::<Foo>::null();
+        let mut len: c_int = 0;
+        let mut cap: c_int = 0;
+        let mut handle = unsafe { ptr.as_vec_mut_with_cap(&mut len, &mut cap) };
+        handle.push_back(Foo(1));
+        handle.push_back(Foo(2));
+        // Spare capacity exists, but only the two initialised elements must be dropped.
+        assert!(handle.capacity().unwrap() >= 2);
+        assert_that!(DROPPED.load(Ordering::Relaxed), eq(0));
+        handle.clear();
+        assert_that!(DROPPED.load(Ordering::Relaxed), eq(3));
+    }
+
+    #[gtest]
+    fn c_vec_ref_mut_with_cap_swap() {
+        let mut ptr1 = CBufPtr::<i32>::null();
+        let mut len1: c_int = 0;
+        let mut cap1: c_int = 0;
+        let mut ptr2 = CBufPtr::<i32>::null();
+        let mut len2: c_int = 0;
+        let mut cap2: c_int = 0;
+        {
+            let mut handle1 = unsafe { ptr1.as_vec_mut_with_cap(&mut len1, &mut cap1) };
+            handle1.push_back(1);
+            handle1.push_back(2);
+            let mut handle2 = unsafe { ptr2.as_vec_mut_with_cap(&mut len2, &mut cap2) };
+            handle2.push_back(9);
+
+            handle1.swap(&mut handle2);
+            assert_that!(&*handle1, container_eq([9]));
+            assert_that!(&*handle2, container_eq([1, 2]));
+
+            handle1.clear();
+            handle2.clear();
+        }
+        assert_that!(len1, eq(0));
+        assert_that!(len2, eq(0));
+    }
+
+    #[gtest]
+    fn c_vec_ref_mut_with_cap_u8_growth_past_128() {
+        let mut ptr = CBufPtr::<u8>::null();
+        let mut len: u8 = 0;
+        let mut cap: u8 = 0;
+        {
+            let mut handle = unsafe { ptr.as_vec_mut_with_cap(&mut len, &mut cap) };
+            for i in 0..=254 {
+                assert!(handle.try_push_back(i as u8).is_ok());
+            }
+            assert_that!(handle.len(), eq(255));
+            assert_that!(handle.capacity(), some(eq(255)));
+
+            // 256th push cannot fit in u8 length or capacity.
+            let res = handle.try_push_back(42);
+            assert!(res.is_err());
+            assert_that!(res.unwrap_err(), eq(42));
+            handle.clear();
+        }
+        assert!(ptr.is_null());
+        assert_that!(len, eq(0));
+        assert_that!(cap, eq(0));
+    }
+
+    #[gtest]
+    fn c_vec_ref_mut_with_cap_i8_growth_past_64() {
+        let mut ptr = CBufPtr::<i8>::null();
+        let mut len: i8 = 0;
+        let mut cap: i8 = 0;
+        {
+            let mut handle = unsafe { ptr.as_vec_mut_with_cap(&mut len, &mut cap) };
+            for i in 0..=126 {
+                assert!(handle.try_push_back(i as i8).is_ok());
+            }
+            assert_that!(handle.len(), eq(127));
+            assert_that!(handle.capacity(), some(eq(127)));
+
+            // 128th push cannot fit in i8.
+            let res = handle.try_push_back(99);
+            assert!(res.is_err());
+            assert_that!(res.unwrap_err(), eq(99));
+            handle.clear();
+        }
+        assert!(ptr.is_null());
+        assert_that!(len, eq(0));
+        assert_that!(cap, eq(0));
+    }
+
+    #[gtest]
+    fn c_vec_ref_mut_with_cap_cap_type_smaller_than_len_type() {
+        let mut ptr = CBufPtr::<u8>::null();
+        let mut len: u16 = 0;
+        let mut cap: u8 = 0;
+        {
+            let mut handle = unsafe { ptr.as_vec_mut_with_cap(&mut len, &mut cap) };
+            for i in 0..=254 {
+                assert!(handle.try_push_back((i % 256) as u8).is_ok());
+            }
+            assert_that!(handle.len(), eq(255));
+            assert_that!(handle.capacity(), some(eq(255)));
+
+            // 256th push fits in len (u16) but exceeds cap (u8).
+            let res = handle.try_push_back(100);
+            assert!(res.is_err());
+            assert_that!(res.unwrap_err(), eq(100));
+            handle.clear();
+        }
+        assert!(ptr.is_null());
+        assert_that!(len, eq(0u16));
+        assert_that!(cap, eq(0u8));
+    }
+
+    #[gtest]
+    #[should_panic(expected = "both handles must track capacity, or neither")]
+    fn c_vec_ref_mut_swap_mismatched_capacity_tracking_panics() {
+        let mut ptr1 = CBufPtr::<i32>::null();
+        let mut len1: c_int = 0;
+        let mut cap1: c_int = 0;
+        let mut ptr2 = CBufPtr::<i32>::null();
+        let mut len2: c_int = 0;
+        let mut handle1 = unsafe { ptr1.as_vec_mut_with_cap(&mut len1, &mut cap1) };
+        let mut handle2 = unsafe { ptr2.as_vec_mut(&mut len2) };
+        handle1.swap(&mut handle2);
     }
 }

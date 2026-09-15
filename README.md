@@ -79,6 +79,12 @@ access and manipulation.
         handle for any `L: CBufLen` (when `A: Default`).
     *   `as_vec_mut_in(&mut len, alloc)` → `CVecRefMut<'_, T, L, A>` — mutable
         vector handle with custom allocator instance.
+    *   `as_vec_mut_with_cap(&mut len, &mut cap)` → `CVecRefMut<'_, T, L, A, C>`
+        — capacity-tracking mutable vector handle. The extra `cap: C` field lets
+        `push_back` reuse spare capacity and grow geometrically, saving
+        reallocations.
+    *   `as_vec_mut_with_cap_in(&mut len, &mut cap, alloc)` → `CVecRefMut<'_, T,
+        L, A, C>` — capacity-tracking handle with a custom allocator instance.
     *   `clone_and_leak(&[T])` → `CBufPtr<T>` — create a new CBufPtr by cloning
         an existing slice using `LibcAlloc`.
     *   `clone_and_leak_in(&[T], alloc)` → `CBufPtr<T, A>` — create a new
@@ -100,14 +106,19 @@ access and manipulation.
         without deallocating.
     *   `into_raw(self)` → `*mut T` — extract raw pointer without deallocating.
 
-*   **`CVecRefMut<'a, T, L, A = LibcAlloc>`**: A borrowed mutable "vec-like"
-    struct. Implements `DerefMut` to `&mut [T]`. Additional methods:
+*   **`CVecRefMut<'a, T, L, A = LibcAlloc, C = L>`**: A borrowed mutable
+    "vec-like" struct. Implements `DerefMut` to `&mut [T]`. When constructed via
+    `as_vec_mut_with_cap[_in]`, it also borrows a capacity field of type `C`.
+    Additional methods:
 
-    *   `push_back(T)` / `try_push_back(T)` — append via allocator
-        (`grow`/`realloc`).
-    *   `clear()` — drop all elements, free memory via allocator, reset to
-        null/0.
-    *   `swap(&mut CVecRefMut)` — swap two handles using the same allocator.
+    *   `push_back(T)` / `try_push_back(T)` — append an element. When capacity
+        is tracked, appends into spare capacity without reallocating and grows
+        geometrically once full; otherwise reallocates by one slot per push.
+    *   `capacity()` → `Option<usize>` — the tracked capacity, if any.
+    *   `clear()` — drop all elements, free the (full-capacity) allocation via
+        the allocator, and reset to null/0.
+    *   `swap(&mut CVecRefMut)` — swap two handles (pointer, len, and capacity)
+        using the same allocator.
 
 Usage example:
 
