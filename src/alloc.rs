@@ -10,7 +10,7 @@
 
 use allocator_api2::alloc::{AllocError, Allocator, Layout};
 use allocator_api2::boxed::Box;
-use core::ptr::{self, NonNull};
+use core::ptr::NonNull;
 
 /// A `Box` that uses the C allocator (`LibcAlloc`).
 pub type CBox<T> = Box<T, LibcAlloc>;
@@ -43,18 +43,7 @@ const MALLOC_ALIGN: usize = {
 /// (`layout.size() == 0`) without calling the system allocator (`malloc(0)`).
 #[inline]
 fn dangling_slice(layout: Layout) -> NonNull<[u8]> {
-    // How this works:
-    // - `layout.align()` is guaranteed by `Layout` invariants to be a non-zero power of two (>= 1).
-    // - `without_provenance_mut` yields a pointer with the given address and no provenance. This
-    //   is correct because the pointer is never dereferenced, it only has to be non-null and
-    //   aligned. (A plain `as` cast would work too, but is rejected by Miri's strict provenance
-    //   mode since it fabricates provenance out of thin air.)
-    //   Because this address is non-zero, `NonNull::new` is guaranteed to succeed and never panic.
-    // - Because the address is numerically equal to `layout.align()`, it is naturally an integer
-    //   multiple of `layout.align()`, ensuring the pointer is properly aligned.
-    // - `NonNull::slice_from_raw_parts` attaches a slice length of 0 to form the `NonNull<[u8]>`.
-    let ptr = NonNull::new(ptr::without_provenance_mut::<u8>(layout.align())).unwrap();
-    NonNull::slice_from_raw_parts(ptr, 0)
+    NonNull::slice_from_raw_parts(layout.dangling_ptr(), 0)
 }
 
 /// Zero-sized allocator backed by standard C library `malloc`, `calloc`, `realloc`, and `free`.
@@ -196,11 +185,13 @@ mod tests {
         assert_that!(res, ok(anything()));
         let slice = res.unwrap();
         assert_that!(slice.len(), eq(0));
+        assert_that!((slice.as_ptr() as *const u8 as usize) % layout0.align(), eq(0));
         let non_null = NonNull::new(slice.as_ptr() as *mut u8).unwrap();
 
         // Grow 0 -> 0
         let grown0 = unsafe { alloc.grow(non_null, layout0, layout0) }.unwrap();
         assert_that!(grown0.len(), eq(0));
+        assert_that!((grown0.as_ptr() as *const u8 as usize) % layout0.align(), eq(0));
         let non_null0 = NonNull::new(grown0.as_ptr() as *mut u8).unwrap();
 
         // Grow 0 -> 16
@@ -211,6 +202,7 @@ mod tests {
         // Shrink 16 -> 0
         let shrunk0 = unsafe { alloc.shrink(non_null16, layout16, layout0) }.unwrap();
         assert_that!(shrunk0.len(), eq(0));
+        assert_that!((shrunk0.as_ptr() as *const u8 as usize) % layout0.align(), eq(0));
         let non_null_final = NonNull::new(shrunk0.as_ptr() as *mut u8).unwrap();
 
         // SAFETY: `non_null_final` was returned by `shrink` with `layout0`.
