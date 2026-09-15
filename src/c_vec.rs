@@ -24,7 +24,7 @@ use core::ptr::{self, NonNull};
 
 /// A borrowed mutable handle over a `(*mut T, L)` pair representing a dynamic C vector.
 ///
-/// Created via [`CBufPtr::with_len_vec_mut`] or [`CBufPtr::with_len_vec_mut_in`].
+/// Created via [`CBufPtr::as_vec_mut`] or [`CBufPtr::as_vec_mut_in`].
 /// Provides mutable slice access and vector mutation operations ([`push_back`](Self::push_back),
 /// [`try_push_back`](Self::try_push_back), [`clear`](Self::clear), [`replace`](Self::replace), [`swap`](Self::swap)).
 ///
@@ -246,7 +246,7 @@ mod tests {
     fn c_vec_ref_mut_null_ptr() {
         let mut ptr = CBufPtr::<i32>::null();
         let mut len: c_int = 0;
-        let handle = unsafe { ptr.with_len_vec_mut(&mut len) };
+        let handle = unsafe { ptr.as_vec_mut(&mut len) };
         assert_that!(handle.len(), eq(0));
         assert!(handle.is_empty());
     }
@@ -257,7 +257,7 @@ mod tests {
         // clear() must still free the buffer.
         let mut ptr = unsafe { CBufPtr::<i32>::from_raw(libc::malloc(16) as *mut i32) };
         let mut len: c_int = 0;
-        let mut handle = unsafe { ptr.with_len_vec_mut(&mut len) };
+        let mut handle = unsafe { ptr.as_vec_mut(&mut len) };
         assert_that!(handle.len(), eq(0));
         assert!(handle.is_empty());
         handle.clear();
@@ -271,7 +271,7 @@ mod tests {
         // push_back() must free the previous buffer and grow properly.
         let mut ptr = unsafe { CBufPtr::<i32>::from_raw(libc::malloc(16) as *mut i32) };
         let mut len: c_int = 0;
-        let mut handle = unsafe { ptr.with_len_vec_mut(&mut len) };
+        let mut handle = unsafe { ptr.as_vec_mut(&mut len) };
         handle.push_back(123);
         assert_that!(&*handle, container_eq([123]));
         handle.clear();
@@ -282,7 +282,7 @@ mod tests {
     #[gtest]
     fn c_vec_ref_mut_deref() {
         let (mut ptr, mut len) = unsafe { malloc_array([5, 6, 7]) };
-        let handle = unsafe { ptr.with_len_vec_mut(&mut len) };
+        let handle = unsafe { ptr.as_vec_mut(&mut len) };
         assert_that!(&*handle, container_eq([5, 6, 7]));
         assert_that!(handle.len(), eq(3));
 
@@ -294,7 +294,7 @@ mod tests {
     #[gtest]
     fn c_vec_ref_mut_deref_mut() {
         let (mut ptr, mut len) = unsafe { malloc_array([1, 2, 3]) };
-        let mut handle = unsafe { ptr.with_len_vec_mut(&mut len) };
+        let mut handle = unsafe { ptr.as_vec_mut(&mut len) };
         handle[0] = 99;
         assert_that!(&*handle, container_eq([99, 2, 3]));
         handle.clear();
@@ -304,7 +304,7 @@ mod tests {
     fn c_vec_ref_mut_push_back_to_empty() {
         let mut ptr = CBufPtr::<i32>::null();
         let mut len: c_int = 0;
-        let mut handle = unsafe { ptr.with_len_vec_mut(&mut len) };
+        let mut handle = unsafe { ptr.as_vec_mut(&mut len) };
         handle.push_back(42);
         assert_that!(&*handle, container_eq([42]));
         handle.push_back(43);
@@ -317,7 +317,7 @@ mod tests {
     #[gtest]
     fn c_vec_ref_mut_push_back_to_existing() {
         let (mut ptr, mut len) = unsafe { malloc_array([10]) };
-        let mut handle = unsafe { ptr.with_len_vec_mut(&mut len) };
+        let mut handle = unsafe { ptr.as_vec_mut(&mut len) };
         handle.push_back(20);
         handle.push_back(30);
         assert_that!(&*handle, container_eq([10, 20, 30]));
@@ -333,7 +333,7 @@ mod tests {
         let mut count: c_int = 0;
         {
             // SAFETY: Null pointer with length 0 is safe.
-            let mut handle = unsafe { ptr.with_len_vec_mut_in(&mut count, &alloc) };
+            let mut handle = unsafe { ptr.as_vec_mut_in(&mut count, &alloc) };
             assert_that!(handle.allocator().alloc_count.load(Ordering::SeqCst), eq(0));
             handle.push_back(100);
             assert_that!(alloc.alloc_count.load(Ordering::SeqCst), eq(1));
@@ -359,7 +359,7 @@ mod tests {
         let mut count: c_int = 0;
         {
             // SAFETY: ptr is non-null, count is 0, allocated via alloc.
-            let mut handle = unsafe { ptr.with_len_vec_mut_in(&mut count, &alloc) };
+            let mut handle = unsafe { ptr.as_vec_mut_in(&mut count, &alloc) };
             assert_that!(alloc.alloc_count.load(Ordering::SeqCst), eq(1));
             assert_that!(alloc.grow_count.load(Ordering::SeqCst), eq(0));
             assert_that!(alloc.dealloc_count.load(Ordering::SeqCst), eq(0));
@@ -380,7 +380,7 @@ mod tests {
     fn c_vec_ref_mut_try_push_back_overflow() {
         let mut ptr = CBufPtr::<i32>::null();
         let mut len: c_int = c_int::MAX;
-        let mut handle = unsafe { ptr.with_len_vec_mut(&mut len) };
+        let mut handle = unsafe { ptr.as_vec_mut(&mut len) };
         let result = handle.try_push_back(999);
         assert!(result.is_err());
         assert_that!(result.unwrap_err(), eq(999));
@@ -389,7 +389,7 @@ mod tests {
     #[gtest]
     fn c_vec_ref_mut_clear_nonempty() {
         let (mut ptr, mut len) = unsafe { malloc_array([1, 2, 3]) };
-        let mut handle = unsafe { ptr.with_len_vec_mut(&mut len) };
+        let mut handle = unsafe { ptr.as_vec_mut(&mut len) };
         handle.clear();
         assert_that!(handle.len(), eq(0));
         assert!(ptr.is_null());
@@ -402,8 +402,8 @@ mod tests {
         let (mut ptr2, mut len2) = unsafe { malloc_array([4, 5]) };
 
         {
-            let mut handle1 = unsafe { ptr1.with_len_vec_mut(&mut len1) };
-            let mut handle2 = unsafe { ptr2.with_len_vec_mut(&mut len2) };
+            let mut handle1 = unsafe { ptr1.as_vec_mut(&mut len1) };
+            let mut handle2 = unsafe { ptr2.as_vec_mut(&mut len2) };
 
             handle1.swap(&mut handle2);
 
@@ -420,9 +420,9 @@ mod tests {
         assert_that!(unsafe { ptr2.with_len(len2) }, container_eq([1, 2, 3]));
 
         // Clean up both handles.
-        let mut handle1 = unsafe { ptr1.with_len_vec_mut(&mut len1) };
+        let mut handle1 = unsafe { ptr1.as_vec_mut(&mut len1) };
         handle1.clear();
-        let mut handle2 = unsafe { ptr2.with_len_vec_mut(&mut len2) };
+        let mut handle2 = unsafe { ptr2.as_vec_mut(&mut len2) };
         handle2.clear();
     }
 
@@ -438,9 +438,9 @@ mod tests {
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // SAFETY: Testing that swap panics when allocators differ.
-            let mut handle1 = unsafe { ptr1.with_len_vec_mut_in(&mut len1, &alloc1) };
+            let mut handle1 = unsafe { ptr1.as_vec_mut_in(&mut len1, &alloc1) };
             // SAFETY: Testing that swap panics when allocators differ.
-            let mut handle2 = unsafe { ptr2.with_len_vec_mut_in(&mut len2, &alloc2) };
+            let mut handle2 = unsafe { ptr2.as_vec_mut_in(&mut len2, &alloc2) };
             handle1.swap(&mut handle2);
         }));
         assert!(result.is_err());
@@ -450,7 +450,7 @@ mod tests {
     fn c_vec_ref_mut_clear_already_empty() {
         let mut ptr = CBufPtr::<i32>::null();
         let mut len: c_int = 0;
-        let mut handle = unsafe { ptr.with_len_vec_mut(&mut len) };
+        let mut handle = unsafe { ptr.as_vec_mut(&mut len) };
         // Clearing an already-empty slice should not panic.
         handle.clear();
         assert!(ptr.is_null());
@@ -468,7 +468,7 @@ mod tests {
         }
 
         let (mut ptr, mut len) = unsafe { malloc_array([Foo(1), Foo(2)]) };
-        let mut handle = unsafe { ptr.with_len_vec_mut(&mut len) };
+        let mut handle = unsafe { ptr.as_vec_mut(&mut len) };
 
         assert_that!(DROPPED.load(Ordering::Relaxed), eq(0));
         handle.clear();
@@ -488,7 +488,7 @@ mod tests {
 
         let (mut ptr, mut len) = unsafe { malloc_array([PanickingDrop(1)]) };
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut handle = unsafe { ptr.with_len_vec_mut(&mut len) };
+            let mut handle = unsafe { ptr.as_vec_mut(&mut len) };
             handle.clear();
         }));
 
@@ -501,7 +501,7 @@ mod tests {
     fn c_vec_ref_mut_usize() {
         let mut ptr = CBufPtr::<i32>::null();
         let mut len: usize = 0;
-        let mut handle = unsafe { ptr.with_len_vec_mut(&mut len) };
+        let mut handle = unsafe { ptr.as_vec_mut(&mut len) };
         handle.push_back(100);
         handle.push_back(200);
         assert_that!(&*handle, container_eq([100, 200]));
@@ -515,7 +515,7 @@ mod tests {
     fn c_vec_ref_mut_u32() {
         let mut ptr = CBufPtr::<i32>::null();
         let mut len: u32 = 0;
-        let mut handle = unsafe { ptr.with_len_vec_mut(&mut len) };
+        let mut handle = unsafe { ptr.as_vec_mut(&mut len) };
         handle.push_back(42);
         assert_that!(&*handle, container_eq([42]));
         assert_that!(handle.len(), eq(1));
@@ -527,7 +527,7 @@ mod tests {
     fn c_vec_ref_mut_u64() {
         let mut ptr = CBufPtr::<i32>::null();
         let mut len: u64 = 0;
-        let mut handle = unsafe { ptr.with_len_vec_mut(&mut len) };
+        let mut handle = unsafe { ptr.as_vec_mut(&mut len) };
         handle.push_back(77);
         assert_that!(&*handle, container_eq([77]));
         assert_that!(handle.len(), eq(1));
@@ -539,7 +539,7 @@ mod tests {
     fn c_vec_ref_mut_u8_overflow() {
         let mut ptr = CBufPtr::<i32>::null();
         let mut len: u8 = u8::MAX;
-        let mut handle = unsafe { ptr.with_len_vec_mut(&mut len) };
+        let mut handle = unsafe { ptr.as_vec_mut(&mut len) };
         let result = handle.try_push_back(999);
         assert!(result.is_err());
         assert_that!(result.unwrap_err(), eq(999));

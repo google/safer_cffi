@@ -43,7 +43,7 @@
 //!     // Mutable vector accessor — returns CVecRefMut (from &mut self and &mut item_len).
 //!     fn items_vec_mut(&mut self) -> CVecRefMut<'_, f32, c_int> {
 //!         // SAFETY: the length of `items` is `item_len`.
-//!         unsafe { self.items.with_len_vec_mut(&mut self.item_len) }
+//!         unsafe { self.items.as_vec_mut(&mut self.item_len) }
 //!     }
 //! }
 //!
@@ -154,7 +154,7 @@ unsafe impl CBufLen for i64 {}
 ///
 /// `CBufPtr` provides [`with_len`](Self::with_len) to get a `&[T]` slice,
 /// [`with_len_mut`](Self::with_len_mut) to get a `&mut [T]` slice,
-/// [`with_len_vec_mut`](Self::with_len_vec_mut) to create a [`CVecRefMut`] handle,
+/// [`as_vec_mut`](Self::as_vec_mut) to create a [`CVecRefMut`] handle,
 /// and [`clone_and_leak`](Self::clone_and_leak) to clone a Rust slice into a
 /// C-allocated buffer.
 ///
@@ -277,7 +277,7 @@ impl<T, A: Allocator> CBufPtr<T, A> {
     /// # Panics
     ///
     /// Panics if `*len` is negative or exceeds the maximum safe slice length.
-    pub unsafe fn with_len_vec_mut_in<'a, L: CBufLen>(
+    pub unsafe fn as_vec_mut_in<'a, L: CBufLen>(
         &'a mut self,
         len: &'a mut L,
         alloc: A,
@@ -406,14 +406,14 @@ impl<T> CBufPtr<T, LibcAlloc> {
     /// # Panics
     ///
     /// Panics if `*len` is negative or exceeds the maximum safe slice length.
-    pub unsafe fn with_len_vec_mut<'a, L: CBufLen>(
+    pub unsafe fn as_vec_mut<'a, L: CBufLen>(
         &'a mut self,
         len: &'a mut L,
     ) -> CVecRefMut<'a, T, L, LibcAlloc> {
         // SAFETY: The caller guarantees `len` is the exact length and no active aliases exist.
         // Compatibility with `LibcAlloc` is an invariant of `CBufPtr<T, LibcAlloc>` and the
         // fact that all instances of LibcAlloc are equivalent.
-        unsafe { self.with_len_vec_mut_in(len, LibcAlloc) }
+        unsafe { self.as_vec_mut_in(len, LibcAlloc) }
     }
 
     /// Clone the contents of a Rust slice into a new C-allocated buffer using [`LibcAlloc`].
@@ -631,7 +631,7 @@ mod tests {
         let mut count: c_int = 3;
         let mut ptr = cloned;
         // SAFETY: `ptr` was allocated via `alloc` with `count` elements.
-        let mut handle = unsafe { ptr.with_len_vec_mut_in(&mut count, &alloc) };
+        let mut handle = unsafe { ptr.as_vec_mut_in(&mut count, &alloc) };
         handle.clear();
         assert_that!(alloc.dealloc_count.load(Ordering::SeqCst), eq(1));
     }
@@ -770,10 +770,10 @@ mod tests {
     }
 
     #[gtest]
-    fn c_buf_ptr_with_len_vec_mut_libc() {
+    fn c_buf_ptr_as_vec_mut_libc() {
         let mut ptr = CBufPtr::<i32>::null();
         let mut count: c_int = 0;
-        let mut handle = unsafe { ptr.with_len_vec_mut(&mut count) };
+        let mut handle = unsafe { ptr.as_vec_mut(&mut count) };
         handle.push_back(123);
         assert_that!(&*handle, container_eq([123]));
         handle.clear();
@@ -783,10 +783,10 @@ mod tests {
 
     #[gtest]
     #[should_panic(expected = "CBufPtr: len is negative")]
-    fn c_buf_ptr_with_len_vec_mut_negative_len() {
+    fn c_buf_ptr_as_vec_mut_negative_len() {
         let mut ptr = CBufPtr::<i32>::null();
         let mut count: c_int = -5;
-        let _ = unsafe { ptr.with_len_vec_mut(&mut count) };
+        let _ = unsafe { ptr.as_vec_mut(&mut count) };
     }
 
     // -----------------------------------------------------------------------

@@ -28,7 +28,7 @@ impl IntArray {
 
     pub fn items_vec_mut(&mut self) -> CVecRefMut<'_, i32, i32> {
         // SAFETY: the length of `items` is `item_len`.
-        unsafe { self.items.with_len_vec_mut(&mut self.item_len) }
+        unsafe { self.items.as_vec_mut(&mut self.item_len) }
     }
 }
 

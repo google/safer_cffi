@@ -75,10 +75,10 @@ access and manipulation.
         CBufLen`.
     *   `with_len_mut(len)` → `&mut [T]` — mutable slice view for any `len: L`
         where `L: CBufLen` and `A = LibcAlloc`.
-    *   `with_len_vec_mut(&mut len)` → `CVecRefMut<'_, T, L, A>` — mutable
-        vector handle for any `L: CBufLen` (when `A: Default`).
-    *   `with_len_vec_mut_in(&mut len, alloc)` → `CVecRefMut<'_, T, L, A>` —
-        mutable vector handle with custom allocator instance.
+    *   `as_vec_mut(&mut len)` → `CVecRefMut<'_, T, L, A>` — mutable vector
+        handle for any `L: CBufLen` (when `A: Default`).
+    *   `as_vec_mut_in(&mut len, alloc)` → `CVecRefMut<'_, T, L, A>` — mutable
+        vector handle with custom allocator instance.
     *   `clone_and_leak(&[T])` → `CBufPtr<T>` — create a new CBufPtr by cloning
         an existing slice using `LibcAlloc`.
     *   `clone_and_leak_in(&[T], alloc)` → `CBufPtr<T, A>` — create a new
@@ -130,7 +130,7 @@ impl MyStruct {
     }
     fn items_vec_mut(&mut self) -> CVecRefMut<'_, Item, c_int> {
         // SAFETY: the length of `items` is `item_len`.
-        unsafe { self.items.with_len_vec_mut(&mut self.item_len) }
+        unsafe { self.items.as_vec_mut(&mut self.item_len) }
     }
 }
 ```
