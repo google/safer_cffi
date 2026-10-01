@@ -15,21 +15,20 @@
 //!
 //! There are two tracker variants available:
 //!
-//! - **Opaque Tracker** (`OpaqueTracker`): Uses synthetic IDs to track objects (`Handle<T>`).
-//!   Use this to provide opaque pointers to C code. This is faster and safer than the
-//!   raw tracker.
+//! - **Opaque Tracker** (`OpaqueTracker`): Uses synthetic IDs to track objects (`Handle<T>`). Use
+//!   this to provide opaque pointers to C code. This is faster and safer than the raw tracker.
 //!
-//! - **Raw Tracker** (`RawTracker`): Uses raw memory addresses (`*mut T`) as keys.
-//!   Use this only if you need to interoperate with existing C code that requires the actual
-//!   pointer value, e.g. for field access without helpers.
+//! - **Raw Tracker** (`RawTracker`): Uses raw memory addresses (`*mut T`) as keys. Use this only if
+//!   you need to interoperate with existing C code that requires the actual pointer value, e.g. for
+//!   field access without helpers.
 //!
 //!   The raw tracker comes with two caveats:
 //!
-//!   - The raw tracker cannot be used if the API allows for objects to be created on the C
-//!     side. All objects must be created from the Rust side.
-//!   - It does not prevent ABA problems. That is, if an object is deallocated and a new object
-//!     is allocated in the same memory location, pointers to the old object will now silently
-//!     point to the new object.
+//!   - The raw tracker cannot be used if the API allows for objects to be created on the C side.
+//!     All objects must be created from the Rust side.
+//!   - It does not prevent ABA problems. That is, if an object is deallocated and a new object is
+//!     allocated in the same memory location, pointers to the old object will now silently point to
+//!     the new object.
 //!
 //! ## C Slices and Vectors
 //!
@@ -37,12 +36,12 @@
 //! arrays (where `L` is an integer length type such as `c_int` or `usize`).
 //! [`CBufPtr`], [`OwnedCBufPtr`], and [`CVecRefMut`] provide safe handles over these pairs:
 //!
-//! - **[`CBufPtr`]**: A `#[repr(transparent)]` wrapper around `*mut T` for use in
-//!   `#[repr(C)]` struct definitions. Encodes the allocator type (defaulting to [`LibcAlloc`]).
-//!   Provides [`with_len`](CBufPtr::with_len) to get a `&[T]` slice,
-//!   [`with_len_mut`](CBufPtr::with_len_mut) to get a mutable `&mut [T]` slice,
-//!   [`as_vec_mut`](CBufPtr::as_vec_mut) to create a mutable `CVecRefMut`
-//!   handle, and [`clone_and_leak`](CBufPtr::clone_and_leak) to clone a Rust slice into a C-allocated buffer.
+//! - **[`CBufPtr`]**: A `#[repr(transparent)]` wrapper around `*mut T` for use in `#[repr(C)]`
+//!   struct definitions. Encodes the allocator type (defaulting to [`LibcAlloc`]). Provides
+//!   [`with_len`](CBufPtr::with_len) to get a `&[T]` slice, [`with_len_mut`](CBufPtr::with_len_mut)
+//!   to get a mutable `&mut [T]` slice, [`as_vec_mut`](CBufPtr::as_vec_mut) to create a mutable
+//!   `CVecRefMut` handle, and [`clone_and_leak`](CBufPtr::clone_and_leak) to clone a Rust slice
+//!   into a C-allocated buffer.
 //!
 //! - **[`OwnedCBufPtr`]**: A `#[repr(transparent)]` wrapper around [`CBufPtr`] for `Copy` types
 //!   that automatically frees the allocated buffer on drop. Dereferences to `CBufPtr` to provide
@@ -69,7 +68,7 @@ pub(crate) mod raw;
 pub(crate) mod testing;
 pub(crate) mod tracker;
 
-pub use alloc::{CBox, DropByPtrAllocator, LibcAlloc};
+pub use alloc::{CBox, CVec, DropByPtrAllocator, LibcAlloc};
 pub use allocator_api2::alloc::Allocator;
 pub use c_buf::{CBufLen, CBufPtr, OwnedCBufPtr};
 pub use c_str::CStrRef;
