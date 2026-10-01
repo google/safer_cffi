@@ -32,6 +32,12 @@ impl IntArray {
     }
 }
 
+impl Clone for IntArray {
+    fn clone(&self) -> Self {
+        Self { items: OwnedCBufPtr::clone_from_slice(self.items()), item_len: self.item_len }
+    }
+}
+
 // Example FFI functions.
 //
 // We focus on `CBufPtr` here, ideally you want to manage `IntArray` with a tracker.

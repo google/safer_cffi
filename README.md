@@ -106,6 +106,13 @@ access and manipulation.
         OwnedCBufPtr from a `Box<[T]>`, transferring ownership.
     *   `from_raw(raw)` → `OwnedCBufPtr<T, A>` (unsafe) — construct from a raw
         pointer, transferring ownership.
+    *   `clone_from_slice(&[T])` → `OwnedCBufPtr<T>` — create a new OwnedCBufPtr
+        by cloning an existing slice using `LibcAlloc`. In particular, this can
+        be used for `Clone` impls of structs with `OwnedCBufPtr` fields.
+    *   `clone_from_slice_in(&[T], alloc)` → `OwnedCBufPtr<T, A>` — create a new
+        OwnedCBufPtr by cloning an existing slice using a custom allocator.
+    *   `try_clone_from_slice[_in]` — fallible variants of the above that return
+        `Err(AllocError)` instead of panicking if allocation fails.
     *   `into_c_buf_ptr(self)` → `CBufPtr<T, A>` — extract inner `CBufPtr`
         without deallocating.
     *   `into_raw(self)` → `*mut T` — extract raw pointer without deallocating.
