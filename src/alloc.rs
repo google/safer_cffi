@@ -10,10 +10,14 @@
 
 use allocator_api2::alloc::{AllocError, Allocator, Layout};
 use allocator_api2::boxed::Box;
+use allocator_api2::vec::Vec;
 use core::ptr::NonNull;
 
 /// A `Box` that uses the C allocator (`LibcAlloc`).
 pub type CBox<T> = Box<T, LibcAlloc>;
+
+/// A `Vec` that uses the C allocator (`LibcAlloc`).
+pub type CVec<T> = Vec<T, LibcAlloc>;
 
 /// The maximum alignment guaranteed by standard `malloc`.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", target_os = "ios"))]
@@ -152,10 +156,10 @@ pub trait DropByPtrAllocator: Allocator {
     ///
     /// # Safety
     ///
-    /// - `ptr` denotes a block of memory currently allocated via this allocator with a
-    ///   non-zero size (`layout.size() > 0`).
-    /// - No active references (`&T` or `&mut T`) or other aliases to the memory block exist,
-    ///   and the memory referenced by `ptr` is not accessed after this call.
+    /// - `ptr` denotes a block of memory currently allocated via this allocator with a non-zero
+    ///   size (`layout.size() > 0`).
+    /// - No active references (`&T` or `&mut T`) or other aliases to the memory block exist, and
+    ///   the memory referenced by `ptr` is not accessed after this call.
     unsafe fn deallocate_by_ptr(ptr: NonNull<u8>);
 }
 
