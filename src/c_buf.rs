@@ -77,6 +77,7 @@ use crate::alloc::{DropByPtrAllocator, LibcAlloc};
 use crate::c_vec::CVecRefMut;
 use crate::errors::AllocError;
 use allocator_api2::alloc::{Allocator, Layout};
+use allocator_api2::boxed;
 use core::fmt;
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
@@ -108,22 +109,22 @@ pub(crate) const fn max_slice_len<T>() -> usize {
 ///
 /// Safe methods on [`CVecRefMut`] (such as
 /// [`as_slice`](CVecRefMut::as_slice), [`as_slice_mut`](CVecRefMut::as_slice_mut),
-/// [`push_back`](CVecRefMut::push_back), and [`clear`](CVecRefMut::clear)) rely on the conversions defined
-/// by this trait to preserve memory safety and prevent out-of-bounds access.
+/// [`push_back`](CVecRefMut::push_back), and [`clear`](CVecRefMut::clear)) rely on the conversions
+/// defined by this trait to preserve memory safety and prevent out-of-bounds access.
 ///
 /// Implementations of this trait must guarantee:
-/// 1. **Purity and Determinism**: `<Self as TryInto<usize>>::try_into` and
-///    `<Self as TryFrom<usize>>::try_from` must be pure functions without side
-///    effects, returning the exact same result for identical inputs every time.
-/// 2. **Round-trip Equivalence**: For any `n: usize` that successfully converts to
-///    `L = Self::try_from(n)`, `L.try_into()` must return `Ok(n)`.
-/// 3. **Non-negative handling**: For signed types, negative values must fail conversion
-///    via `TryInto<usize>` (returning `Err`).
+/// 1. **Purity and Determinism**: `<Self as TryInto<usize>>::try_into` and `<Self as
+///    TryFrom<usize>>::try_from` must be pure functions without side effects, returning the exact
+///    same result for identical inputs every time.
+/// 2. **Round-trip Equivalence**: For any `n: usize` that successfully converts to `L =
+///    Self::try_from(n)`, `L.try_into()` must return `Ok(n)`.
+/// 3. **Non-negative handling**: For signed types, negative values must fail conversion via
+///    `TryInto<usize>` (returning `Err`).
 /// 4. **No Interior Mutability**: `Self` must not use interior mutability (`Cell`, `UnsafeCell`,
 ///    `Atomic*`, etc.) to change its conversion output over time.
-/// 5. **Maximum Value**: `Self::MAX` must be the maximum value representable by `Self` as
-///    a non-negative `usize`, such that `Self::try_from(Self::MAX)` succeeds and round-trips.
-///    For any `n: usize > Self::MAX`, `Self::try_from(n)` must return `Err`.
+/// 5. **Maximum Value**: `Self::MAX` must be the maximum value representable by `Self` as a
+///    non-negative `usize`, such that `Self::try_from(Self::MAX)` succeeds and round-trips. For any
+///    `n: usize > Self::MAX`, `Self::try_from(n)` must return `Err`.
 pub unsafe trait CBufLen:
     Copy
     + TryInto<usize, Error: core::error::Error>
@@ -209,10 +210,11 @@ const fn const_min_u128(a: u128, b: u128) -> u128 {
 /// # Safety Invariants
 ///
 /// - The pointer is either null, or points to an owned array of `T`s of externally specified length
-///   that is not accessed through any other pointer. The array of `T`s ought to also be initialized.
+///   that is not accessed through any other pointer. The array of `T`s ought to also be
+///   initialized.
 /// - The pointer is always aligned for `T`.
-/// - If the pointer is non-null, it has been allocated with the allocator `A` with layout
-///   matching `Layout::array::<T>(len)`.
+/// - If the pointer is non-null, it has been allocated with the allocator `A` with layout matching
+///   `Layout::array::<T>(len)`.
 #[derive(Default)]
 #[repr(transparent)]
 pub struct CBufPtr<T, A = LibcAlloc> {
@@ -236,6 +238,25 @@ impl<T, A: Allocator> CBufPtr<T, A> {
     /// by the allocator `A`.
     pub const unsafe fn from_raw(raw: *mut T) -> Self {
         Self { ptr: raw, _allocator: PhantomData }
+    }
+
+    /// Construct a `CBufPtr` from a boxed slice.
+    ///
+    /// The boxed slice is leaked, so the caller must ensure that the returned `CBufPtr` is freed
+    /// appropriately.
+    pub fn from_boxed_slice(slice: boxed::Box<[T], A>) -> Self {
+        // TODO: Simplify to checking `slice.is_empty()` first when we drop allocator_api2.
+        // `allocator_api2::boxed::Box::drop` incorrectly calls `Allocator::deallocate`
+        // even for zero-sized layouts that were never allocated
+        let raw = boxed::Box::into_raw(slice);
+        if raw.is_empty() {
+            return Self::null();
+        }
+        // SAFETY: `raw` is non-empty, so it is a non-null, aligned pointer to `raw.len()`
+        // initialised elements allocated by `A` with `Layout::array::<T>(len)`. For zero-sized `T`,
+        // `raw` is a non-null dangling pointer, matching what any `Allocator` returns for a ZST
+        // layout.
+        unsafe { Self::from_raw(raw as *mut T) }
     }
 
     /// Return the inner raw pointer.
@@ -352,11 +373,11 @@ impl<T, A: Allocator> CBufPtr<T, A> {
     ///
     /// # Safety
     ///
-    /// - `*cap` is the number of elements the allocation pointed to by
-    ///   `self.ptr` can hold (or 0 if `self.ptr` is null).
+    /// - `*cap` is the number of elements the allocation pointed to by `self.ptr` can hold (or 0 if
+    ///   `self.ptr` is null).
     /// - `*len` is the number of initialized elements, and `*len <= *cap`.
-    /// - The instance of `A` passed to this function MUST BE the same instance that was
-    ///   used for allocation of `self`.
+    /// - The instance of `A` passed to this function MUST BE the same instance that was used for
+    ///   allocation of `self`.
     ///
     /// # Panics
     ///
@@ -389,7 +410,8 @@ impl<T, A: Allocator> CBufPtr<T, A> {
         CVecRefMut { ptr: self, len, capacity: Some(cap), alloc }
     }
 
-    /// Clone the contents of a Rust slice into a new C-allocated buffer using a custom [`Allocator`].
+    /// Clone the contents of a Rust slice into a new C-allocated buffer using a custom
+    /// [`Allocator`].
     ///
     /// This function allocates a new buffer using `alloc`, clones each element
     /// from `src` into it, and returns a [`CBufPtr`] to the buffer.
@@ -431,13 +453,14 @@ impl<T, A: Allocator> CBufPtr<T, A> {
                         self.ptr.as_ptr() as *mut T,
                         self.initialized,
                     );
-                    // SAFETY: By the safety invariants of `CloneDropGuard`, `self.ptr` is aligned for
-                    // `T` and the first `self.initialized` elements are valid, fully initialized
-                    // instances of `T` that can be safely dropped in place.
+                    // SAFETY: By the safety invariants of `CloneDropGuard`, `self.ptr` is aligned
+                    // for `T` and the first `self.initialized` elements are
+                    // valid, fully initialized instances of `T` that can be
+                    // safely dropped in place.
                     unsafe { ptr::drop_in_place(slice) };
                 }
-                // SAFETY: By the safety invariants of `CloneDropGuard`, `self.ptr` was allocated via
-                // `self.alloc` with `self.layout`.
+                // SAFETY: By the safety invariants of `CloneDropGuard`, `self.ptr` was allocated
+                // via `self.alloc` with `self.layout`.
                 unsafe { self.alloc.deallocate(self.ptr, self.layout) };
             }
         }
@@ -519,8 +542,8 @@ impl<T> CBufPtr<T, LibcAlloc> {
     /// # Safety
     ///
     /// - This pointer is tracked with length and capacity.
-    /// - `*cap` is the number of elements the allocation pointed to by
-    ///   `self.ptr` can hold (or 0 if `self.ptr` is null).
+    /// - `*cap` is the number of elements the allocation pointed to by `self.ptr` can hold (or 0 if
+    ///   `self.ptr` is null).
     /// - `*len` is the number of initialized elements, and `*len <= *cap`.
     ///
     /// # Panics
@@ -585,8 +608,8 @@ impl<T, A> fmt::Debug for CBufPtr<T, A> {
 ///
 /// # Safety Invariants
 ///
-/// - If the inner pointer is non-null and `size_of::<T>() > 0`, this `OwnedCBufPtr`
-///   has ownership of the underlying heap allocation allocated by `A`.
+/// - If the inner pointer is non-null and `size_of::<T>() > 0`, this `OwnedCBufPtr` has ownership
+///   of the underlying heap allocation allocated by `A`.
 /// - All references to the pointed-to data borrow through this `OwnedCBufPtr`.
 #[repr(transparent)]
 #[derive(Debug, Default)]
@@ -601,13 +624,11 @@ impl<T: Copy, A: DropByPtrAllocator> Drop for OwnedCBufPtr<T, A> {
             return;
         };
         // SAFETY:
-        // - By the safety invariants of `OwnedCBufPtr`, since `ptr` is non-null and
-        //   `size_of::<T>() > 0`, `ptr` denotes a live, non-zero-sized block of memory
-        //   allocated via `A`.
-        // - `OwnedCBufPtr` holds ownership of the allocation, and since we are
-        //   in `Drop::drop(&mut self)`, no references or aliases to the memory exist or
-        //   can be used after this call because self cannot be currently borrowed and cannot be
-        //   used once drop returns.
+        // - By the safety invariants of `OwnedCBufPtr`, since `ptr` is non-null and `size_of::<T>()
+        //   > 0`, `ptr` denotes a live, non-zero-sized block of memory allocated via `A`.
+        // - `OwnedCBufPtr` holds ownership of the allocation, and since we are in `Drop::drop(&mut
+        //   self)`, no references or aliases to the memory exist or can be used after this call
+        //   because self cannot be currently borrowed and cannot be used once drop returns.
         unsafe {
             A::deallocate_by_ptr(ptr);
         }
@@ -625,13 +646,19 @@ impl<T: Copy, A: DropByPtrAllocator> OwnedCBufPtr<T, A> {
     /// # Safety
     ///
     /// - `raw` satisfies all the safety invariants of [`CBufPtr<T, A>`].
-    /// - If `raw` is non-null and `size_of::<T>() > 0`, ownership of that allocation is
-    ///   transferred to the returned `OwnedCBufPtr`. There are no other references to the
-    ///   allocation.
+    /// - If `raw` is non-null and `size_of::<T>() > 0`, ownership of that allocation is transferred
+    ///   to the returned `OwnedCBufPtr`. There are no other references to the allocation.
     pub const unsafe fn from_raw(raw: *mut T) -> Self {
-        // SAFETY: The caller guarantees that `raw` satisfies all safety invariants of `CBufPtr<T, A>`
-        // and transfers ownership of the allocation to this `OwnedCBufPtr`.
+        // SAFETY: The caller guarantees that `raw` satisfies all safety invariants of `CBufPtr<T,
+        // A>` and transfers ownership of the allocation to this `OwnedCBufPtr`.
         Self(unsafe { CBufPtr::from_raw(raw) })
+    }
+
+    /// Construct an `OwnedCBufPtr` from a boxed slice.
+    ///
+    /// The `OwnedCBufPtr` takes ownership of the buffer backing the boxed slice.
+    pub fn from_boxed_slice(slice: boxed::Box<[T], A>) -> Self {
+        Self(CBufPtr::from_boxed_slice(slice))
     }
 
     /// Consumes the `OwnedCBufPtr`, returning the wrapped [`CBufPtr`] without deallocating it.
@@ -790,6 +817,30 @@ mod tests {
         assert_that!(alloc.alloc_count.load(Ordering::SeqCst), eq(1));
         assert_that!(alloc.dealloc_count.load(Ordering::SeqCst), eq(1));
         assert_that!(DROPPED.load(Ordering::SeqCst), eq(2));
+    }
+
+    // -----------------------------------------------------------------------
+    //  from_boxed_slice tests
+    // -----------------------------------------------------------------------
+
+    #[gtest]
+    fn from_boxed_slice_empty_is_null() {
+        let alloc = TrackingAlloc::default();
+        let boxed = allocator_api2::vec::Vec::<i32, _>::new_in(&alloc).into_boxed_slice();
+        let ptr = CBufPtr::from_boxed_slice(boxed);
+        assert!(ptr.is_null());
+        assert_that!(alloc.alloc_count.load(Ordering::SeqCst), eq(0));
+        assert_that!(alloc.dealloc_count.load(Ordering::SeqCst), eq(0));
+    }
+
+    #[gtest]
+    fn from_boxed_slice_libc() {
+        let mut v = crate::CVec::new_in(LibcAlloc);
+        v.try_reserve_exact(1024).unwrap();
+        v.resize(1024, 42u8);
+        let ptr = OwnedCBufPtr::from_boxed_slice(v.into_boxed_slice());
+        assert!(!ptr.is_null());
+        assert!(unsafe { ptr.with_len(1024) }.iter().all(|&b| b == 42));
     }
 
     // -----------------------------------------------------------------------

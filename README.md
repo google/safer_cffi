@@ -89,6 +89,8 @@ access and manipulation.
         an existing slice using `LibcAlloc`.
     *   `clone_and_leak_in(&[T], alloc)` → `CBufPtr<T, A>` — create a new
         CBufPtr by cloning an existing slice using a custom allocator.
+    *   `from_boxed_slice(Box<[T], A>)` → `CBufPtr<T, A>` — create a new CBufPtr
+        from a `Box<[T]>`, transferring ownership.
 
 *   **`OwnedCBufPtr<T: Copy, A: DropByPtrAllocator = LibcAlloc>`**: RAII-owning
     buffer pointer wrapper (`#[repr(transparent)]` around `*mut T`).
@@ -100,6 +102,8 @@ access and manipulation.
     methods.
 
     *   `null()` → `OwnedCBufPtr<T, A>` — create a null owned buffer pointer.
+    *   `from_boxed_slice(Box<[T], A>)` → `OwnedCBufPtr<T, A>` — create a new
+        OwnedCBufPtr from a `Box<[T]>`, transferring ownership.
     *   `from_raw(raw)` → `OwnedCBufPtr<T, A>` (unsafe) — construct from a raw
         pointer, transferring ownership.
     *   `into_c_buf_ptr(self)` → `CBufPtr<T, A>` — extract inner `CBufPtr`
