@@ -661,6 +661,24 @@ impl<T: Copy, A: DropByPtrAllocator> OwnedCBufPtr<T, A> {
         Self(CBufPtr::from_boxed_slice(slice))
     }
 
+    /// Clone the contents of a Rust slice into a new buffer allocated with a custom [`Allocator`].
+    ///
+    /// Returns a null `OwnedCBufPtr` for empty slices and `Err(AllocError)` on allocation failure.
+    pub fn try_clone_from_slice_in(src: &[T], alloc: A) -> Result<Self, AllocError> {
+        // `try_clone_and_leak_in` returns a fresh allocation (or null) that nothing else points to,
+        // so `Self` can take ownership of it.
+        CBufPtr::try_clone_and_leak_in(src, alloc).map(Self)
+    }
+
+    /// Clone the contents of a Rust slice into a new buffer allocated with a custom [`Allocator`].
+    /// Returns a null `OwnedCBufPtr` for empty slices.
+    ///
+    /// # Panics
+    /// Panics if allocation fails.
+    pub fn clone_from_slice_in(src: &[T], alloc: A) -> Self {
+        Self::try_clone_from_slice_in(src, alloc).expect("OwnedCBufPtr: allocation failed")
+    }
+
     /// Consumes the `OwnedCBufPtr`, returning the wrapped [`CBufPtr`] without deallocating it.
     pub fn into_c_buf_ptr(self) -> CBufPtr<T, A> {
         let ptr = self.0.ptr;
@@ -671,6 +689,25 @@ impl<T: Copy, A: DropByPtrAllocator> OwnedCBufPtr<T, A> {
     /// Consumes the `OwnedCBufPtr`, returning the inner raw pointer without deallocating it.
     pub fn into_raw(self) -> *mut T {
         self.into_c_buf_ptr().as_ptr()
+    }
+}
+
+impl<T: Copy> OwnedCBufPtr<T, LibcAlloc> {
+    /// Clone the contents of a Rust slice into a new C-allocated buffer using [`LibcAlloc`].
+    ///
+    /// Returns a null `OwnedCBufPtr` for empty slices and `Err(AllocError)` on allocation failure.
+    pub fn try_clone_from_slice(src: &[T]) -> Result<Self, AllocError> {
+        Self::try_clone_from_slice_in(src, LibcAlloc)
+    }
+
+    /// Clone the contents of a Rust slice into a new C-allocated buffer using [`LibcAlloc`].
+    /// Returns a null `OwnedCBufPtr` for empty slices. In particular, this can be used for `Clone`
+    /// impls of structs with `OwnedCBufPtr` fields.
+    ///
+    /// # Panics
+    /// Panics if `malloc` returns null (out of memory).
+    pub fn clone_from_slice(src: &[T]) -> Self {
+        Self::try_clone_from_slice(src).expect("OwnedCBufPtr: allocation failed")
     }
 }
 
@@ -693,6 +730,7 @@ mod tests {
     #![allow(clippy::undocumented_unsafe_blocks)]
     use super::*;
     use crate::testing::*;
+    use core::cell::Cell;
     use core::sync::atomic::{AtomicUsize, Ordering};
     use googletest::prelude::*;
     use std::ffi::c_int;
@@ -975,27 +1013,32 @@ mod tests {
     //  OwnedCBufPtr tests
     // -----------------------------------------------------------------------
 
-    static GLOBAL_ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
-    static GLOBAL_DEALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
+    // `OwnedCBufPtr` frees via `DropByPtrAllocator::deallocate_by_ptr`, which has no `&self`, so
+    // the counters can't be fields of the allocator. They are thread-local so that tests running
+    // in parallel don't interfere; each test resets them in case a thread runs several tests.
+    thread_local! {
+        static ALLOC_COUNT: Cell<usize> = const { Cell::new(0) };
+        static DEALLOC_COUNT: Cell<usize> = const { Cell::new(0) };
+    }
 
     #[derive(Default, Clone, Copy, Debug)]
     struct GlobalTrackingAlloc;
 
     unsafe impl Allocator for GlobalTrackingAlloc {
         fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-            GLOBAL_ALLOC_COUNT.fetch_add(1, Ordering::SeqCst);
+            ALLOC_COUNT.set(ALLOC_COUNT.get() + 1);
             LibcAlloc.allocate(layout)
         }
 
         unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
-            GLOBAL_DEALLOC_COUNT.fetch_add(1, Ordering::SeqCst);
+            DEALLOC_COUNT.set(DEALLOC_COUNT.get() + 1);
             unsafe { LibcAlloc.deallocate(ptr, layout) };
         }
     }
 
     impl DropByPtrAllocator for GlobalTrackingAlloc {
         unsafe fn deallocate_by_ptr(ptr: NonNull<u8>) {
-            GLOBAL_DEALLOC_COUNT.fetch_add(1, Ordering::SeqCst);
+            DEALLOC_COUNT.set(DEALLOC_COUNT.get() + 1);
             unsafe { LibcAlloc::deallocate_by_ptr(ptr) };
         }
     }
@@ -1055,12 +1098,12 @@ mod tests {
 
     #[gtest]
     fn owned_c_buf_ptr_custom_allocator_and_drop() {
-        GLOBAL_ALLOC_COUNT.store(0, Ordering::SeqCst);
-        GLOBAL_DEALLOC_COUNT.store(0, Ordering::SeqCst);
+        ALLOC_COUNT.set(0);
+        DEALLOC_COUNT.set(0);
 
         let cloned = CBufPtr::try_clone_and_leak_in(&[1, 2, 3, 4], GlobalTrackingAlloc).unwrap();
-        assert_that!(GLOBAL_ALLOC_COUNT.load(Ordering::SeqCst), eq(1));
-        assert_that!(GLOBAL_DEALLOC_COUNT.load(Ordering::SeqCst), eq(0));
+        assert_that!(ALLOC_COUNT.get(), eq(1));
+        assert_that!(DEALLOC_COUNT.get(), eq(0));
 
         {
             let mut owned =
@@ -1075,33 +1118,62 @@ mod tests {
         }
 
         // Dropping owned must call deallocate_by_ptr on the custom allocator.
-        assert_that!(GLOBAL_DEALLOC_COUNT.load(Ordering::SeqCst), eq(1));
+        assert_that!(DEALLOC_COUNT.get(), eq(1));
     }
 
     #[gtest]
     fn owned_c_buf_ptr_into_c_buf_ptr_and_into_raw() {
-        GLOBAL_ALLOC_COUNT.store(0, Ordering::SeqCst);
-        GLOBAL_DEALLOC_COUNT.store(0, Ordering::SeqCst);
+        ALLOC_COUNT.set(0);
+        DEALLOC_COUNT.set(0);
 
         let cloned = CBufPtr::try_clone_and_leak_in(&[5, 6, 7], GlobalTrackingAlloc).unwrap();
         let owned = unsafe { OwnedCBufPtr::<i32, GlobalTrackingAlloc>::from_raw(cloned.as_ptr()) };
 
         // Consuming owned via into_c_buf_ptr should not deallocate.
         let buf_ptr: CBufPtr<i32, GlobalTrackingAlloc> = owned.into_c_buf_ptr();
-        assert_that!(GLOBAL_DEALLOC_COUNT.load(Ordering::SeqCst), eq(0));
+        assert_that!(DEALLOC_COUNT.get(), eq(0));
         assert_that!(unsafe { buf_ptr.with_len(3) }, container_eq([5, 6, 7]));
 
         // Re-wrap and test into_raw.
         let owned2 =
             unsafe { OwnedCBufPtr::<i32, GlobalTrackingAlloc>::from_raw(buf_ptr.as_ptr()) };
         let raw = owned2.into_raw();
-        assert_that!(GLOBAL_DEALLOC_COUNT.load(Ordering::SeqCst), eq(0));
+        assert_that!(DEALLOC_COUNT.get(), eq(0));
         assert_that!(unsafe { core::slice::from_raw_parts(raw, 3) }, container_eq([5, 6, 7]));
 
         // Re-wrap and drop to verify cleanup.
         let owned3 = unsafe { OwnedCBufPtr::<i32, GlobalTrackingAlloc>::from_raw(raw) };
         drop(owned3);
-        assert_that!(GLOBAL_DEALLOC_COUNT.load(Ordering::SeqCst), eq(1));
+        assert_that!(DEALLOC_COUNT.get(), eq(1));
+    }
+
+    #[gtest]
+    fn owned_c_buf_ptr_clone_from_slice() {
+        let src = [10, 20, 30];
+        let owned = OwnedCBufPtr::clone_from_slice(&src);
+        assert!(!owned.is_null());
+        // The buffer is an independent copy.
+        assert!(!core::ptr::eq(owned.as_ptr(), src.as_ptr()));
+        assert_that!(unsafe { owned.with_len(src.len()) }, container_eq(src));
+    }
+
+    #[gtest]
+    fn owned_c_buf_ptr_try_clone_from_slice_empty_is_null() {
+        let owned = OwnedCBufPtr::<i32>::try_clone_from_slice(&[]).unwrap();
+        assert!(owned.is_null());
+    }
+
+    #[gtest]
+    fn owned_c_buf_ptr_clone_from_slice_in_custom_allocator() {
+        ALLOC_COUNT.set(0);
+        DEALLOC_COUNT.set(0);
+
+        let owned = OwnedCBufPtr::clone_from_slice_in(&[1, 2, 3, 4], GlobalTrackingAlloc);
+        assert_that!(ALLOC_COUNT.get(), eq(1));
+        assert_that!(unsafe { owned.with_len(4) }, container_eq([1, 2, 3, 4]));
+
+        drop(owned);
+        assert_that!(DEALLOC_COUNT.get(), eq(1));
     }
 
     #[gtest]

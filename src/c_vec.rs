@@ -10,8 +10,9 @@
 //!
 //! [`CVecRefMut`] represents a borrowed mutable view over a `(*mut T, L)` pair
 //! (where `L` is an integer length type such as `c_int` or `usize`), providing
-//! vector operations like [`push_back`](CVecRefMut::push_back), [`try_push_back`](CVecRefMut::try_push_back),
-//! [`clear`](CVecRefMut::clear), [`replace`](CVecRefMut::replace), and [`swap`](CVecRefMut::swap).
+//! vector operations like [`push_back`](CVecRefMut::push_back),
+//! [`try_push_back`](CVecRefMut::try_push_back), [`clear`](CVecRefMut::clear), and
+//! [`swap`](CVecRefMut::swap).
 
 use crate::alloc::LibcAlloc;
 use crate::c_buf::{max_slice_len, CBufLen, CBufPtr};
@@ -42,7 +43,7 @@ const fn min_non_zero_cap<T>() -> usize {
 ///
 /// Created via [`CBufPtr::as_vec_mut`] or [`CBufPtr::as_vec_mut_in`].
 /// Provides mutable slice access and vector mutation operations ([`push_back`](Self::push_back),
-/// [`try_push_back`](Self::try_push_back), [`clear`](Self::clear), [`replace`](Self::replace), [`swap`](Self::swap)).
+/// [`try_push_back`](Self::try_push_back), [`clear`](Self::clear), [`swap`](Self::swap)).
 ///
 /// Slice access is provided through [`Deref`](core::ops::Deref) and
 /// [`DerefMut`](core::ops::DerefMut), which correctly tie the returned
@@ -60,11 +61,11 @@ const fn min_non_zero_cap<T>() -> usize {
 ///
 /// # Safety Invariant
 ///
-/// - Let `cap` be the tracked capacity if present, or `len` otherwise. If `cap > 0`,
-///   `ptr` is non-null and points to an allocation of exactly `cap` elements of `T`
-///   (allocated by `A`), and `cap <= isize::MAX / size_of::<T>()`.
-/// - `len` is the number of initialised, leading elements and satisfies `len <= cap`.
-///   If `len == 0`, no element is initialised.
+/// - Let `cap` be the tracked capacity if present, or `len` otherwise. If `cap > 0`, `ptr` is
+///   non-null and points to an allocation of exactly `cap` elements of `T` (allocated by `A`), and
+///   `cap <= isize::MAX / size_of::<T>()`.
+/// - `len` is the number of initialised, leading elements and satisfies `len <= cap`. If `len ==
+///   0`, no element is initialised.
 /// - `alloc` is the allocator used for all allocations.
 /// - `capacity` is `Some` if and only if this handle tracks capacity.
 pub struct CVecRefMut<'a, T, L: CBufLen, A: Allocator = LibcAlloc, C: CBufLen = L> {
@@ -85,10 +86,10 @@ impl<'a, T, L: CBufLen, A: Allocator, C: CBufLen> CVecRefMut<'a, T, L, A, C> {
             return &[];
         }
         // SAFETY:
-        // - Since `ptr` is not null, the invariants for `CBufPtr` guarantee that `ptr` points to
-        //   an owned array of `T`s, and that the pointer is aligned for `T`.
-        // - `CBufPtr` owns the underlying array, so the pointer is valid for
-        //   reads for the lifetime of this object (&self, created from a `CBufPtr`).
+        // - Since `ptr` is not null, the invariants for `CBufPtr` guarantee that `ptr` points to an
+        //   owned array of `T`s, and that the pointer is aligned for `T`.
+        // - `CBufPtr` owns the underlying array, so the pointer is valid for reads for the lifetime
+        //   of this object (&self, created from a `CBufPtr`).
         // - The invariant for `CVecRefMut` guarantees that `len` is the valid length of the array
         //   (as per CBufLen's safety contract) pointed to by `ptr`.
         // - `L: CBufLen` guarantees that `try_into()` is deterministic and pure.
@@ -103,10 +104,10 @@ impl<'a, T, L: CBufLen, A: Allocator, C: CBufLen> CVecRefMut<'a, T, L, A, C> {
             return &mut [];
         }
         // SAFETY:
-        // - Since `ptr` is not null, the invariants for `CBufPtr` guarantee that `ptr` points to
-        //   an owned array of `T`s, and that the pointer is aligned for `T`.
-        // - `CBufPtr` owns the underlying array, so the pointer is valid for
-        //   reads for the lifetime of this object (&self, created from a `CBufPtr`).
+        // - Since `ptr` is not null, the invariants for `CBufPtr` guarantee that `ptr` points to an
+        //   owned array of `T`s, and that the pointer is aligned for `T`.
+        // - `CBufPtr` owns the underlying array, so the pointer is valid for reads for the lifetime
+        //   of this object (&self, created from a `CBufPtr`).
         // - The invariant for `CVecRefMut` guarantees that `len` is the valid length of the array
         //   pointed to by `ptr`.
         // - `L: CBufLen` guarantees that `try_into()` is deterministic and pure.
