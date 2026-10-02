@@ -45,16 +45,19 @@
 //!
 //! - **[`OwnedCBufPtr`]**: A `#[repr(transparent)]` wrapper around [`CBufPtr`] for `Copy` types
 //!   that automatically frees the allocated buffer on drop. Dereferences to `CBufPtr` to provide
-//!   all its slice and vector accessor methods.
+//!   all its slice and vector accessor methods. Use
+//!   [`clone_from_slice`](OwnedCBufPtr::clone_from_slice) to clone a Rust slice into a new owned
+//!   buffer, e.g. to implement `Clone` for the containing struct.
 //!
 //! - **[`CVecRefMut`]** (growable vector handle): Provides mutable slice access via
 //!   [`DerefMut`](core::ops::DerefMut), plus [`push_back`](CVecRefMut::push_back),
-//!   [`try_push_back`](CVecRefMut::try_push_back), [`clear`](CVecRefMut::clear),
-//!   [`replace`](CVecRefMut::replace), and [`swap`](CVecRefMut::swap) for array mutation.
+//!   [`try_push_back`](CVecRefMut::try_push_back), [`clear`](CVecRefMut::clear), and
+//!   [`swap`](CVecRefMut::swap) for array mutation.
 //!
 //! All vector operations default to the **C allocator** (`malloc`/`free`) for allocations,
 //! ensuring compatibility with memory managed across the FFI boundary, and support custom
-//! [`Allocator`] implementations via `as_vec_mut_in` and `clone_and_leak_in`.
+//! [`Allocator`] implementations via `as_vec_mut_in`, `clone_and_leak_in`, and
+//! `clone_from_slice_in`.
 
 pub(crate) mod alloc;
 pub(crate) mod c_buf;
