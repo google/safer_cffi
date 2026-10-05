@@ -83,17 +83,24 @@ use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 use core::ptr::{self, NonNull};
 
+/// Rejects zero-sized `T`s, which do not exist in C and are not supported by [`CBufPtr`],
+/// [`OwnedCBufPtr`], and [`CVecRefMut`].
+///
+/// Must be called in a `const` block so that the check happens at compile time.
+const fn assert_not_zst<T>() {
+    assert!(core::mem::size_of::<T>() > 0, "T has zero size, which is not supported");
+}
+
 /// The maximum slice length for type `T` that stays within the
 /// [`isize::MAX`]-byte limit required by [`core::slice::from_raw_parts`].
 ///
 /// On 64-bit platforms this vastly exceeds `c_int::MAX`, so any runtime
 /// comparison against it is optimized away by the compiler.
 pub(crate) const fn max_slice_len<T>() -> usize {
-    if core::mem::size_of::<T>() == 0 {
-        usize::MAX
-    } else {
-        isize::MAX as usize / core::mem::size_of::<T>()
+    const {
+        assert_not_zst::<T>();
     }
+    isize::MAX as usize / core::mem::size_of::<T>()
 }
 
 // ---------------------------------------------------------------------------
@@ -207,6 +214,8 @@ const fn const_min_u128(a: u128, b: u128) -> u128 {
 /// as `*mut T` and can be used directly in `#[repr(C)]` struct definitions without
 /// affecting ABI compatibility.
 ///
+/// Zero-sized `T`s are not supported and are rejected at compile time.
+///
 /// # Safety Invariants
 ///
 /// - The pointer is either null, or points to an owned array of `T`s of externally specified length
@@ -215,7 +224,6 @@ const fn const_min_u128(a: u128, b: u128) -> u128 {
 /// - The pointer is always aligned for `T`.
 /// - If the pointer is non-null, it has been allocated with the allocator `A` with layout matching
 ///   `Layout::array::<T>(len)`.
-#[derive(Default)]
 #[repr(transparent)]
 pub struct CBufPtr<T, A = LibcAlloc> {
     ptr: *mut T,
@@ -225,6 +233,9 @@ pub struct CBufPtr<T, A = LibcAlloc> {
 impl<T, A: Allocator> CBufPtr<T, A> {
     /// Create a null `CBufPtr`.
     pub const fn null() -> Self {
+        const {
+            assert_not_zst::<T>();
+        }
         // SAFETY: null pointers trivially satisfy all other safety invariants of CBufPtr.
         Self { ptr: ptr::null_mut(), _allocator: PhantomData }
     }
@@ -237,6 +248,9 @@ impl<T, A: Allocator> CBufPtr<T, A> {
     /// [`CBufPtr`], including that if non-null, it points to properly aligned memory allocated
     /// by the allocator `A`.
     pub const unsafe fn from_raw(raw: *mut T) -> Self {
+        const {
+            assert_not_zst::<T>();
+        }
         Self { ptr: raw, _allocator: PhantomData }
     }
 
@@ -252,10 +266,9 @@ impl<T, A: Allocator> CBufPtr<T, A> {
         if raw.is_empty() {
             return Self::null();
         }
-        // SAFETY: `raw` is non-empty, so it is a non-null, aligned pointer to `raw.len()`
-        // initialised elements allocated by `A` with `Layout::array::<T>(len)`. For zero-sized `T`,
-        // `raw` is a non-null dangling pointer, matching what any `Allocator` returns for a ZST
-        // layout.
+        // SAFETY: `raw` is non-empty and `T` is not zero-sized, so it is a non-null, aligned
+        // pointer to `raw.len()` initialised elements allocated by `A` with
+        // `Layout::array::<T>(raw.len())`.
         unsafe { Self::from_raw(raw as *mut T) }
     }
 
@@ -595,6 +608,12 @@ impl<T, A> fmt::Debug for CBufPtr<T, A> {
     }
 }
 
+impl<T, A: Allocator> Default for CBufPtr<T, A> {
+    fn default() -> Self {
+        Self::null()
+    }
+}
+
 /// A [`CBufPtr`] that owns the allocated buffer.
 ///
 /// This is a wrapper around [`CBufPtr`] that automatically deallocates the buffer when the
@@ -608,8 +627,8 @@ impl<T, A> fmt::Debug for CBufPtr<T, A> {
 ///
 /// # Safety Invariants
 ///
-/// - If the inner pointer is non-null and `size_of::<T>() > 0`, this `OwnedCBufPtr` has ownership
-///   of the underlying heap allocation allocated by `A`.
+/// - If the inner pointer is non-null, this `OwnedCBufPtr` has ownership of the underlying heap
+///   allocation allocated by `A`.
 /// - All references to the pointed-to data borrow through this `OwnedCBufPtr`.
 #[repr(transparent)]
 #[derive(Debug, Default)]
@@ -617,15 +636,12 @@ pub struct OwnedCBufPtr<T: Copy, A: DropByPtrAllocator = LibcAlloc>(CBufPtr<T, A
 
 impl<T: Copy, A: DropByPtrAllocator> Drop for OwnedCBufPtr<T, A> {
     fn drop(&mut self) {
-        if core::mem::size_of::<T>() == 0 {
-            return;
-        }
         let Some(ptr) = NonNull::new(self.0.ptr.cast::<u8>()) else {
             return;
         };
         // SAFETY:
-        // - By the safety invariants of `OwnedCBufPtr`, since `ptr` is non-null and `size_of::<T>()
-        //   > 0`, `ptr` denotes a live, non-zero-sized block of memory allocated via `A`.
+        // - By the safety invariants of `OwnedCBufPtr`, since `ptr` is non-null, `ptr` denotes a
+        //   live, non-zero-sized block of memory allocated via `A`.
         // - `OwnedCBufPtr` holds ownership of the allocation, and since we are in `Drop::drop(&mut
         //   self)`, no references or aliases to the memory exist or can be used after this call
         //   because self cannot be currently borrowed and cannot be used once drop returns.
@@ -646,8 +662,8 @@ impl<T: Copy, A: DropByPtrAllocator> OwnedCBufPtr<T, A> {
     /// # Safety
     ///
     /// - `raw` satisfies all the safety invariants of [`CBufPtr<T, A>`].
-    /// - If `raw` is non-null and `size_of::<T>() > 0`, ownership of that allocation is transferred
-    ///   to the returned `OwnedCBufPtr`. There are no other references to the allocation.
+    /// - If `raw` is non-null, ownership of that allocation is transferred to the returned
+    ///   `OwnedCBufPtr`. There are no other references to the allocation.
     pub const unsafe fn from_raw(raw: *mut T) -> Self {
         // SAFETY: The caller guarantees that `raw` satisfies all safety invariants of `CBufPtr<T,
         // A>` and transfers ownership of the allocation to this `OwnedCBufPtr`.
@@ -1065,15 +1081,6 @@ mod tests {
         let slice = unsafe { owned.with_len(0) };
         assert!(slice.is_empty());
         // Dropping null OwnedCBufPtr must be safe.
-    }
-
-    #[gtest]
-    fn owned_c_buf_ptr_zst_drop() {
-        let cloned = CBufPtr::try_clone_and_leak(&[(), (), ()]).unwrap();
-        assert!(!cloned.is_null());
-        let owned = unsafe { OwnedCBufPtr::<()>::from_raw(cloned.as_ptr()) };
-        assert_that!(unsafe { owned.with_len(3) }, container_eq([(), (), ()]));
-        // Dropping owned with non-null dangling ZST pointer must not call free().
     }
 
     #[gtest]
