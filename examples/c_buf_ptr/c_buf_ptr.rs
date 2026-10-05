@@ -34,7 +34,7 @@ impl IntArray {
 
 impl Clone for IntArray {
     fn clone(&self) -> Self {
-        IntArray { items: OwnedCBufPtr::clone_from_slice(self.items()), item_len: self.item_len }
+        Self { items: OwnedCBufPtr::clone_from_slice(self.items()), item_len: self.item_len }
     }
 }
 
