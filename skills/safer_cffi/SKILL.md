@@ -38,16 +38,23 @@ Module                                 | Contents                               
 `ffi.rs`                               | `#[unsafe(no_mangle)] pub extern "C" fn` wrappers: unpack arguments, call the core, map results to the C error convention | Ideally none; sometimes necessary for raw `(ptr, len)` parameters
 Core modules (`decoder.rs`, ...)       | The algorithm, written against slices, references and Rust types                                                          | None: `#![forbid(unsafe_code)]` at the top of each file
 
+*   **Size the FFI layer to the library.** For small and medium-sized libraries,
+    one `ffi.rs` plus an optional `c_types.rs` is enough. Larger libraries can
+    split `ffi.rs` into submodules (e.g. `ffi/decode.rs`, `ffi/encode.rs`).
 *   **Naming:** the core follows Rust conventions (`d_gif_open_file`,
     `snake_case` locals). Only the `extern "C"` wrappers, and the `#[repr(C)]`
     structs/fields, keep the exact C names (`DGifOpenFileName`). Put
-    `#![allow(non_snake_case)]` on `ffi.rs` and the C types module, never on the
-    crate root or the core.
-*   **Wrappers stay thin.** No algorithm logic in `ffi.rs`: if a wrapper grows
-    beyond argument unpacking and error mapping, move the logic into the core
-    where `forbid(unsafe_code)` applies.
+    `#![allow(non_snake_case)]` on the FFI modules and
+    `#![allow(nonstandard_style)]` on the C types module (C type names like
+    `z_stream` also trip `non_camel_case_types`), never on the crate root or the
+    core.
+*   **Wrappers stay thin.** No algorithm logic in the FFI layer: if a wrapper
+    grows beyond argument unpacking and error mapping, move the logic into the
+    core where `forbid(unsafe_code)` applies.
 *   **Re-export at the crate root** (`pub use c_types::*; pub use ffi::*;`); the
-    signatures test looks up every function and type there.
+    signatures test looks up every function and type there. A split `ffi` must
+    also re-export its submodules (`pub use decode::*;` inside `ffi`), because
+    `pub use ffi::*` does not reach into them.
 
 ## Choosing the Rust type for a C construct
 
