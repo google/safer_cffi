@@ -6,7 +6,8 @@ description: >-
   (OpaqueTracker, Handle), nullable-pointer parameter idioms (Option-wrapped
   references, boxes and CStrRef), pointer+length array fields in repr(C) structs
   (CBufPtr, OwnedCBufPtr, CVecRefMut) backed by the C allocator, and matching C
-  behaviour (out-params on error paths, aliased arguments, panics). Use when
+  behaviour (out-params on error paths, partially-initialised input structs,
+  aliased arguments, panics). Use when
   designing or porting a Rust drop-in replacement of a C library, writing or
   reviewing no_mangle extern "C" functions, repr(C) structs, or
   create/borrow/destroy object lifecycles, when choosing between raw pointers
@@ -359,6 +360,43 @@ Also write what C writes on success (e.g. `*ErrorCode = D_GIF_SUCCEEDED` in a
 close function), and comment deliberate differences (e.g. reporting an error
 code where C leaves `*ErrorCode` untouched).
 
+### Partially-initialised input structs
+
+C callers routinely allocate an input struct on the stack and only initialise
+the fields that the specific C function reads.
+
+By [UCG#414](https://github.com/rust-lang/unsafe-code-guidelines/issues/414),
+forming `&T` (`Option<&T>` or `unsafe { raw_ptr.as_ref() }`) to a
+partially-initialised struct is valid as long as the uninitialised fields are
+never read. However, copying or cloning the whole struct (`*p`, `p.cloned()`,
+`#[derive(Clone)]`) reads *every* field:
+
+1.  **Immediate UB:** loading an uninitialised field with validity invariants
+    (such as `bool`, which must be `0` or `1`) is undefined behaviour even if
+    the field is overwritten on the next line (`let mut m = cm.clone();
+    m.SortFlag = false;`).
+2.  **Enum niche hazard:** if `T` contains a niche-bearing field like `bool`
+    (niches `2..=255`) and the cloned `T` is wrapped in e.g. `Option<T>`,
+    `rustc` stores the enum discriminant inside that `bool` field.
+    Pattern-matching the enum (`if let Arg::New(x) = arg`) then branches on the
+    uninitialised byte—triggering MemorySanitizer or misbranching at
+    runtime—even if the core function never reads the field.
+
+Whenever an entry point copies an input struct `T`, check how C copies it. If C
+only reads a subset of fields (or reconstructs the object through a helper that
+defaults the rest), obtain `&T` and copy only the fields C reads, initialising
+the remaining fields to their C defaults:
+
+```rust
+// C's EGifPutImageDesc builds the local map with GifMakeMapObject, which sets
+// SortFlag = false and never reads ColorMap->SortFlag.
+unsafe { color_map.as_ref() }.map(|cm| ColorMapObject {
+    BitsPerPixel: cm.BitsPerPixel,
+    SortFlag: false,
+    // ...
+})
+```
+
 ### Aliased arguments
 
 A reference parameter must stay valid until the function returns, even if it is
@@ -392,9 +430,11 @@ parameter may point into:
 
     If the core clones `Arg::New` values, clone at the FFI boundary and accept
     `Arg<T>` instead of `Arg<&T>`. This makes it easier to reason about aliasing
-    violations: `Arg::New(unsafe { raw_ptr.as_ref() }.cloned())`. Don't compare
-    addresses in the core. Internal callers pass `Arg::Current` or an owned
-    value or reference without aliasing violations.
+    violations: `Arg::New(unsafe { raw_ptr.as_ref() }.cloned())` (or copy only
+    the fields C reads if callers may pass a
+    [partially-initialised input struct](#partially-initialised-input-structs)).
+    Don't compare addresses in the core. Internal callers pass `Arg::Current` or
+    an owned value or reference without aliasing violations.
 *   **Grow:** take the parameter as a raw `*const T` (so the function becomes
     `unsafe`), copy from it with `unsafe { p.as_ref() }` *before* calling into
     the core.
@@ -414,29 +454,30 @@ only copes with it by accident. Let the `CBufPtr` checks panic.
 
 ## Anti-patterns
 
-Don't                                                                                | Do instead                                                                           | Why
-:----------------------------------------------------------------------------------- | :----------------------------------------------------------------------------------- | :--
-`pub unsafe extern "C" fn f(p: *mut T)` + `if p.is_null()` + `&mut *p`               | `pub extern "C" fn f(p: Option<&mut T>)`                                             | Same ABI, no `unsafe`, null handled by the type.
-`Box::into_raw` / `Box::from_raw` for opaque objects                                 | `OpaqueTracker` + `Handle<T>`                                                        | `from_raw` on a stale or forged pointer is UB; the tracker returns `Err`.
-`&CStr`, `&str`, `String` in an `extern "C"` signature                               | `Option<CStrRef<'_>>` (input) / `clone_and_leak` of bytes (output)                   | Rust strings are fat pointers; not a `char*`.
-`Option<Box<T>>` for a pointer C may have `malloc`ed                                 | `Option<CBox<T>>`                                                                    | Allocator mismatch on drop.
-`Handle<T>` for a struct whose fields appear in the header                           | `#[repr(C)] T` with `Option<&mut T>` / `Option<Box<T>>` (or `RawTracker`)            | C code reads the fields through the pointer.
-`TRACKER.borrow_mut(h).unwrap()`                                                     | `let Ok(mut x) = TRACKER.borrow_mut(h) else { return ERR }`                          | Panics abort across `extern "C"`.
-`if h == Handle::null() { return ERR }` before `borrow_mut`/`reclaim`                | Just handle the `Err`                                                                | A null handle never matches; the tracker already returns `NotFound`.
-`static T: OnceLock<OpaqueTracker<_>>` / `lazy_static!`                              | `static T: OpaqueTracker<_> = OpaqueTracker::new();`                                 | `new()` is `const`.
-Holding a `Tracked` guard while calling a C callback                                 | Copy out what the callback needs, drop the guard, then call                          | Re-entrant use of the same handle fails with `AlreadyBorrowedMutably`.
-`Option<&mut MaybeUninit<T>>` + `p.write(v)` for an out-param without drop glue      | `Option<&mut T>` + `*p = v`, written where C writes it; never read it first          | `&mut T` to uninitialised memory is fine ([UCG#414](https://github.com/rust-lang/unsafe-code-guidelines/issues/414)); reading it as `T` is not, and `.write(0)` placeholders clobber `*p` on early errors.
-`*mut T` + `len` fields with ad-hoc `from_raw_parts` at each use site                | `OwnedCBufPtr`/`CBufPtr` + accessors holding the only `unsafe`                       | One invariant, one place to audit.
-Bumping `len` yourself after writing past the end                                    | `items_vec().push_back(v)`                                                           | The handle reallocates and updates `len` atomically.
-`push_back(v)` followed by `count += 1` (or any helper that already grows the array) | Let `CVecRefMut` own the count                                                       | The extra increment leaves an uninitialised ghost element that C later reads.
-`n as usize` on a signed C return or callback result (`-1` = error/EOF)              | Check `n < 0` first, or `usize::try_from(n)`                                         | `-1` becomes `usize::MAX` and slips past guards like `n < 1`.
-C-style names (`DGifGetLine`) or `#![allow(non_snake_case)]` in core modules         | Rust names in the core; C names only on `extern "C"` wrappers and `#[repr(C)]` types | Keeps the lint useful where the logic lives.
-`push_back` in an entry point that returns an error code on OOM                      | `try_push_back(v)` and map `Err` to the error code                                   | `push_back` panics on allocation failure.
-`impl Drop` that calls `clear()` on an `OwnedCBufPtr` field                          | Nothing; `OwnedCBufPtr` frees itself                                                 | Redundant `unsafe` and a second invariant to keep in sync.
-`OwnedCBufPtr::from_boxed_slice(std_vec.into_boxed_slice())`                         | Build a `CVec` (`Vec<T, LibcAlloc>`)                                                 | C frees the buffer with `free()`; it must come from `malloc`.
-`RawTracker` "because the API already passes pointers"                               | `OpaqueTracker` unless C dereferences the pointer                                    | Raw keys are slower and vulnerable to ABA reuse.
-Mismatched integer widths (`u32` for `int32_t`, `usize` for `int`)                   | Match the header exactly (`i32`, `c_int`)                                            | Links fine, corrupts data on the C side.
-Replacing or freeing a field while a parameter may point to it (`f(g, g->map)`)      | Raw pointer in wrapper; `Arg::Current` if it is that field, else `Arg::New(copy)`    | `take()` drops fields on early errors; a borrowed parameter may alias anything `g` owns, not just the replaced field.
-Returning an out-param in `Ok(..)`, or splitting the core function around it         | Pass it into the core as `&mut T` and write it where C does                          | C may store it before a later step fails; the core keeps C's control flow.
-Safe `extern "C" fn` that trusts one parameter to match another (slot + count)       | `unsafe extern "C" fn` with a `# Safety` section                                     | Safe Rust callers could pass mismatched values.
-Resetting the count or returning early when the array is null but the count is not   | Let `as_vec_mut` panic                                                               | The struct is already corrupt, and C only copes with it by accident.
+Don't                                                                                | Do instead                                                                            | Why
+:----------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------ | :--
+`pub unsafe extern "C" fn f(p: *mut T)` + `if p.is_null()` + `&mut *p`               | `pub extern "C" fn f(p: Option<&mut T>)`                                              | Same ABI, no `unsafe`, null handled by the type.
+`Box::into_raw` / `Box::from_raw` for opaque objects                                 | `OpaqueTracker` + `Handle<T>`                                                         | `from_raw` on a stale or forged pointer is UB; the tracker returns `Err`.
+`&CStr`, `&str`, `String` in an `extern "C"` signature                               | `Option<CStrRef<'_>>` (input) / `clone_and_leak` of bytes (output)                    | Rust strings are fat pointers; not a `char*`.
+`Option<Box<T>>` for a pointer C may have `malloc`ed                                 | `Option<CBox<T>>`                                                                     | Allocator mismatch on drop.
+`Handle<T>` for a struct whose fields appear in the header                           | `#[repr(C)] T` with `Option<&mut T>` / `Option<Box<T>>` (or `RawTracker`)             | C code reads the fields through the pointer.
+`TRACKER.borrow_mut(h).unwrap()`                                                     | `let Ok(mut x) = TRACKER.borrow_mut(h) else { return ERR }`                           | Panics abort across `extern "C"`.
+`if h == Handle::null() { return ERR }` before `borrow_mut`/`reclaim`                | Just handle the `Err`                                                                 | A null handle never matches; the tracker already returns `NotFound`.
+`static T: OnceLock<OpaqueTracker<_>>` / `lazy_static!`                              | `static T: OpaqueTracker<_> = OpaqueTracker::new();`                                  | `new()` is `const`.
+Holding a `Tracked` guard while calling a C callback                                 | Copy out what the callback needs, drop the guard, then call                           | Re-entrant use of the same handle fails with `AlreadyBorrowedMutably`.
+`Option<&mut MaybeUninit<T>>` + `p.write(v)` for an out-param without drop glue      | `Option<&mut T>` + `*p = v`, written where C writes it; never read it first           | `&mut T` to uninitialised memory is fine ([UCG#414](https://github.com/rust-lang/unsafe-code-guidelines/issues/414)); reading it as `T` is not, and `.write(0)` placeholders clobber `*p` on early errors.
+`p.cloned()` / `*p` on an input struct when C only reads a subset of its fields      | Borrow `&T` and construct a new `T` from only the fields C reads, defaulting the rest | Whole-struct copies load uninitialised fields; if a `bool` field is uninitialised, `Option<T>` / `Arg<Option<T>>` puts its niche discriminant there and branches on garbage.
+`*mut T` + `len` fields with ad-hoc `from_raw_parts` at each use site                | `OwnedCBufPtr`/`CBufPtr` + accessors holding the only `unsafe`                        | One invariant, one place to audit.
+Bumping `len` yourself after writing past the end                                    | `items_vec().push_back(v)`                                                            | The handle reallocates and updates `len` atomically.
+`push_back(v)` followed by `count += 1` (or any helper that already grows the array) | Let `CVecRefMut` own the count                                                        | The extra increment leaves an uninitialised ghost element that C later reads.
+`n as usize` on a signed C return or callback result (`-1` = error/EOF)              | Check `n < 0` first, or `usize::try_from(n)`                                          | `-1` becomes `usize::MAX` and slips past guards like `n < 1`.
+C-style names (`DGifGetLine`) or `#![allow(non_snake_case)]` in core modules         | Rust names in the core; C names only on `extern "C"` wrappers and `#[repr(C)]` types  | Keeps the lint useful where the logic lives.
+`push_back` in an entry point that returns an error code on OOM                      | `try_push_back(v)` and map `Err` to the error code                                    | `push_back` panics on allocation failure.
+`impl Drop` that calls `clear()` on an `OwnedCBufPtr` field                          | Nothing; `OwnedCBufPtr` frees itself                                                  | Redundant `unsafe` and a second invariant to keep in sync.
+`OwnedCBufPtr::from_boxed_slice(std_vec.into_boxed_slice())`                         | Build a `CVec` (`Vec<T, LibcAlloc>`)                                                  | C frees the buffer with `free()`; it must come from `malloc`.
+`RawTracker` "because the API already passes pointers"                               | `OpaqueTracker` unless C dereferences the pointer                                     | Raw keys are slower and vulnerable to ABA reuse.
+Mismatched integer widths (`u32` for `int32_t`, `usize` for `int`)                   | Match the header exactly (`i32`, `c_int`)                                             | Links fine, corrupts data on the C side.
+Replacing or freeing a field while a parameter may point to it (`f(g, g->map)`)      | Raw pointer in wrapper; `Arg::Current` if it is that field, else `Arg::New(copy)`     | `take()` drops fields on early errors; a borrowed parameter may alias anything `g` owns, not just the replaced field.
+Returning an out-param in `Ok(..)`, or splitting the core function around it         | Pass it into the core as `&mut T` and write it where C does                           | C may store it before a later step fails; the core keeps C's control flow.
+Safe `extern "C" fn` that trusts one parameter to match another (slot + count)       | `unsafe extern "C" fn` with a `# Safety` section                                      | Safe Rust callers could pass mismatched values.
+Resetting the count or returning early when the array is null but the count is not   | Let `as_vec_mut` panic                                                                | The struct is already corrupt, and C only copes with it by accident.
