@@ -119,7 +119,7 @@ pub(crate) const fn max_slice_len<T>() -> usize {
 /// [`push_back`](CVecRefMut::push_back), and [`clear`](CVecRefMut::clear)) rely on the conversions
 /// defined by this trait to preserve memory safety and prevent out-of-bounds access.
 ///
-/// Implementations of this trait must guarantee:
+/// Implementors must ensure that:
 /// 1. **Purity and Determinism**: `<Self as TryInto<usize>>::try_into` and `<Self as
 ///    TryFrom<usize>>::try_from` must be pure functions without side effects, returning the exact
 ///    same result for identical inputs every time.
@@ -143,48 +143,64 @@ pub unsafe trait CBufLen:
     const MAX: usize;
 }
 
-// SAFETY: Primitive unsigned integer types satisfy purity, determinism,
-// and round-trip conversion to/from `usize` within their representable ranges,
-// with `MAX` set to the maximum value representable as a `usize`.
+// SAFETY: `usize` is a primitive unsigned integer without interior mutability whose identity
+// `TryFrom<usize>` and `TryInto<usize>` conversions are pure, deterministic, and round-trip for
+// all values up to `usize::MAX`.
 unsafe impl CBufLen for usize {
     const MAX: usize = usize::MAX;
 }
-// SAFETY: see usize
+// SAFETY: `u8` is a primitive unsigned integer without interior mutability whose standard
+// `TryFrom<usize>` and `TryInto<usize>` conversions are pure, deterministic, and round-trip for
+// all values in `0..=u8::MAX as usize`.
 unsafe impl CBufLen for u8 {
     const MAX: usize = u8::MAX as usize;
 }
-// SAFETY: see usize
+// SAFETY: `u16` is a primitive unsigned integer without interior mutability whose standard
+// `TryFrom<usize>` and `TryInto<usize>` conversions are pure, deterministic, and round-trip for
+// all values in `0..=u16::MAX as usize`.
 unsafe impl CBufLen for u16 {
     const MAX: usize = u16::MAX as usize;
 }
-// SAFETY: see usize
+// SAFETY: `u32` is a primitive unsigned integer without interior mutability whose standard
+// `TryFrom<usize>` and `TryInto<usize>` conversions are pure, deterministic, and round-trip for
+// all values in `0..=Self::MAX`.
 unsafe impl CBufLen for u32 {
     const MAX: usize = const_min_u128(u32::MAX as u128, usize::MAX as u128) as usize;
 }
-// SAFETY: see usize
+// SAFETY: `u64` is a primitive unsigned integer without interior mutability whose standard
+// `TryFrom<usize>` and `TryInto<usize>` conversions are pure, deterministic, and round-trip for
+// all values in `0..=Self::MAX`.
 unsafe impl CBufLen for u64 {
     const MAX: usize = const_min_u128(u64::MAX as u128, usize::MAX as u128) as usize;
 }
 
-// SAFETY: Primitive signed integer types satisfy purity, determinism,
-// and correctly fail conversion via `TryInto<usize>` on negative values,
-// with `MAX` set to the maximum value representable as a `usize`.
+// SAFETY: `isize` is a primitive signed integer without interior mutability whose standard
+// `TryFrom<usize>` and `TryInto<usize>` conversions are pure, deterministic, reject negative
+// values, and round-trip for all values in `0..=isize::MAX as usize`.
 unsafe impl CBufLen for isize {
     const MAX: usize = isize::MAX as usize;
 }
-// SAFETY: see isize
+// SAFETY: `i8` is a primitive signed integer without interior mutability whose standard
+// `TryFrom<usize>` and `TryInto<usize>` conversions are pure, deterministic, reject negative
+// values, and round-trip for all values in `0..=i8::MAX as usize`.
 unsafe impl CBufLen for i8 {
     const MAX: usize = i8::MAX as usize;
 }
-// SAFETY: see isize
+// SAFETY: `i16` is a primitive signed integer without interior mutability whose standard
+// `TryFrom<usize>` and `TryInto<usize>` conversions are pure, deterministic, reject negative
+// values, and round-trip for all values in `0..=i16::MAX as usize`.
 unsafe impl CBufLen for i16 {
     const MAX: usize = i16::MAX as usize;
 }
-// SAFETY: see isize
+// SAFETY: `i32` is a primitive signed integer without interior mutability whose standard
+// `TryFrom<usize>` and `TryInto<usize>` conversions are pure, deterministic, reject negative
+// values, and round-trip for all values in `0..=Self::MAX`.
 unsafe impl CBufLen for i32 {
     const MAX: usize = const_min_u128(i32::MAX as u128, usize::MAX as u128) as usize;
 }
-// SAFETY: see isize
+// SAFETY: `i64` is a primitive signed integer without interior mutability whose standard
+// `TryFrom<usize>` and `TryInto<usize>` conversions are pure, deterministic, reject negative
+// values, and round-trip for all values in `0..=Self::MAX`.
 unsafe impl CBufLen for i64 {
     const MAX: usize = const_min_u128(i64::MAX as u128, usize::MAX as u128) as usize;
 }
@@ -226,6 +242,8 @@ const fn const_min_u128(a: u128, b: u128) -> u128 {
 ///   `Layout::array::<T>(len)`.
 #[repr(transparent)]
 pub struct CBufPtr<T, A = LibcAlloc> {
+    // Safety invariant: Either null, or non-null, properly aligned for `T`, and allocated by `A`
+    // for an externally tracked capacity of `T` elements.
     ptr: *mut T,
     _allocator: PhantomData<A>,
 }
@@ -244,9 +262,11 @@ impl<T, A: Allocator> CBufPtr<T, A> {
     ///
     /// # Safety
     ///
-    /// The caller must ensure that `raw` satisfies all the safety invariants of
-    /// [`CBufPtr`], including that if non-null, it points to properly aligned memory allocated
-    /// by the allocator `A`.
+    /// The caller must ensure that:
+    /// - `raw` is either null, or points to a live allocation created by allocator `A` that is
+    ///   properly aligned for `T`.
+    /// - While this `CBufPtr` manages the allocation, the memory is not accessed or freed through
+    ///   any conflicting pointer.
     pub const unsafe fn from_raw(raw: *mut T) -> Self {
         const {
             assert_not_zst::<T>();
@@ -289,7 +309,11 @@ impl<T, A: Allocator> CBufPtr<T, A> {
     ///
     /// # Safety
     ///
-    /// `len` must be at most as long as the array pointed to by `self.ptr`.
+    /// The caller must ensure that:
+    /// - If `self.ptr` is non-null and `len > 0`, `self.ptr` points to at least `len` consecutive,
+    ///   properly aligned, initialized elements of type `T` within a single live allocation.
+    /// - For the lifetime of the returned slice, the referenced memory is not mutated (except
+    ///   inside an `UnsafeCell`).
     ///
     /// # Panics
     ///
@@ -305,8 +329,10 @@ impl<T, A: Allocator> CBufPtr<T, A> {
             len <= max_slice_len::<T>(),
             "CBufPtr: len {len} exceeds maximum safe slice length"
         );
-        // SAFETY: The caller guarantees that `self.ptr` points to at least `len` initialised
-        // elements of type `T`. `&self` ties the lifetime of the returned slice to the borrow.
+        // SAFETY: `self.ptr` is non-null (checked above) and aligned for `T` (by `CBufPtr`'s
+        // safety invariant). `len * size_of::<T>() <= isize::MAX` (checked above). By the caller's
+        // `# Safety` contract, `self.ptr` is valid for reads of `len` initialized `T` elements in
+        // a single allocation and is not mutated during the lifetime of `&self`.
         unsafe { core::slice::from_raw_parts(self.ptr, len) }
     }
 
@@ -317,8 +343,11 @@ impl<T, A: Allocator> CBufPtr<T, A> {
     ///
     /// # Safety
     ///
-    /// - If `self.ptr` is non-null and `len > 0`, `self.ptr` points to at least `len` initialized,
-    ///   properly aligned elements of type `T`.
+    /// The caller must ensure that:
+    /// - If `self.ptr` is non-null and `len > 0`, `self.ptr` points to at least `len` consecutive,
+    ///   properly aligned, initialized elements of type `T` within a single live allocation.
+    /// - For the lifetime of the returned mutable slice, the referenced memory is not accessed
+    ///   (read or written) through any other pointer or reference.
     ///
     /// # Panics
     ///
@@ -334,8 +363,11 @@ impl<T, A: Allocator> CBufPtr<T, A> {
             len <= max_slice_len::<T>(),
             "CBufPtr: len {len} exceeds maximum safe slice length"
         );
-        // SAFETY: The caller guarantees `self.ptr` is valid for reads and writes for `len`
-        // elements of type `T`, properly aligned, and unaliased for `'a`.
+        // SAFETY: `self.ptr` is non-null (checked above) and aligned for `T` (by `CBufPtr`'s
+        // safety invariant). `len * size_of::<T>() <= isize::MAX` (checked above). By the caller's
+        // `# Safety` contract, `self.ptr` is valid for reads and writes of `len` initialized `T`
+        // elements in a single allocation and is exclusively accessed through `&mut self` for the
+        // lifetime of the returned slice.
         unsafe { core::slice::from_raw_parts_mut(self.ptr, len) }
     }
 
@@ -347,9 +379,13 @@ impl<T, A: Allocator> CBufPtr<T, A> {
     ///
     /// # Safety
     ///
-    /// - `len` is the number of initialized elements pointed to by `self.ptr` (or 0 if empty).
-    /// - The instance of `A` passed to this function MUST BE the same instance that was used for
-    ///   allocation of `self`.
+    /// The caller must ensure that:
+    /// - If `self.ptr` is non-null, it was allocated by `alloc` with layout
+    ///   `Layout::array::<T>((*len).max(1))` and points to `*len` consecutive initialized `T`
+    ///   elements.
+    /// - If `self.ptr` is null, `*len` is `0`.
+    /// - While the returned [`CVecRefMut`] exists, the buffer and `*len` are not accessed through
+    ///   any other pointer.
     ///
     /// # Panics
     ///
@@ -386,11 +422,13 @@ impl<T, A: Allocator> CBufPtr<T, A> {
     ///
     /// # Safety
     ///
-    /// - `*cap` is the number of elements the allocation pointed to by `self.ptr` can hold (or 0 if
-    ///   `self.ptr` is null).
-    /// - `*len` is the number of initialized elements, and `*len <= *cap`.
-    /// - The instance of `A` passed to this function MUST BE the same instance that was used for
-    ///   allocation of `self`.
+    /// The caller must ensure that:
+    /// - If `self.ptr` is non-null, it was allocated by `alloc` with layout
+    ///   `Layout::array::<T>((*cap).max(1))`, `*len <= *cap`, and the first `*len` elements are
+    ///   initialized `T` values.
+    /// - If `self.ptr` is null, `*cap` and `*len` are `0`.
+    /// - While the returned [`CVecRefMut`] exists, the buffer, `*len`, and `*cap` are not accessed
+    ///   through any other pointer.
     ///
     /// # Panics
     ///
@@ -447,14 +485,14 @@ impl<T, A: Allocator> CBufPtr<T, A> {
 
         /// Drop guard that cleans up allocated memory and drops initialized elements
         /// if element cloning panics.
-        ///
-        /// # Safety invariant:
-        /// - `ptr` was allocated via `alloc::allocate` and is properly aligned for `T`.
-        /// - The first `initialized` elements at `ptr` are valid instances of `T`.
         struct CloneDropGuard<'g, T, A: Allocator> {
             alloc: &'g A,
+            // Safety invariant: `ptr` was allocated via `self.alloc` with `self.layout` and is
+            // properly aligned for `T`.
             ptr: NonNull<u8>,
             layout: Layout,
+            // Safety invariant: The first `initialized` elements at `self.ptr` are valid,
+            // initialized instances of `T`.
             initialized: usize,
             _marker: PhantomData<T>,
         }
@@ -491,19 +529,19 @@ impl<T, A: Allocator> CBufPtr<T, A> {
 
         // Clone each element directly into the allocated buffer.
         for (i, item) in src.iter().enumerate() {
-            // SAFETY: `dst.add(i)` is within the allocated region and not yet
-            // initialised, so `ptr::write` is the correct way to place a value.
-            // Alignment is guaranteed by `CBufPtr`'s safety invariant.
+            // SAFETY: `dst` was allocated with `Layout::for_value(src)` (`<= isize::MAX` bytes)
+            // and `i < src.len()`, so `dst.add(i)` is in-bounds of the allocation, properly
+            // aligned for `T`, and valid for writes.
             unsafe { ptr::write(dst.add(i), item.clone()) };
-            // There is now one more initialized element, so increment.
+            // Maintain `guard.initialized` invariant after writing the `i`-th element.
             guard.initialized += 1;
         }
 
         // Success: disarm the guard so the buffer is leaked to the caller as intended.
         core::mem::forget(guard);
 
-        // SAFETY: `dst` was just allocated via `alloc` and all `src.len()` elements were fully
-        // initialised.
+        // SAFETY: `dst` is non-null, properly aligned for `T`, and allocated via `alloc` with all
+        // `src.len()` elements initialized.
         Ok(unsafe { CBufPtr::from_raw(dst) })
     }
 
@@ -529,20 +567,26 @@ impl<T> CBufPtr<T, LibcAlloc> {
     ///
     /// # Safety
     ///
-    /// - This pointer is tracked with length only (no capacity).
-    /// - `len` is the number of initialized elements pointed to by `self.ptr` (or 0 if empty).
+    /// The caller must ensure that:
+    /// - If `self.ptr` is non-null, it was allocated by [`LibcAlloc`] with layout
+    ///   `Layout::array::<T>((*len).max(1))` and points to `*len` consecutive initialized `T`
+    ///   elements.
+    /// - If `self.ptr` is null, `*len` is `0`.
+    /// - While the returned [`CVecRefMut`] exists, the buffer and `*len` are not accessed through
+    ///   any other pointer.
     ///
     /// # Panics
     ///
-    /// Panics if `*len` is negative or exceeds the maximum safe slice length.
+    /// Panics if `*len` is negative, exceeds the maximum safe slice length, or if
+    /// `self.ptr` is null and `*len > 0`.
     pub unsafe fn as_vec_mut<'a, L: CBufLen>(
         &'a mut self,
         len: &'a mut L,
     ) -> CVecRefMut<'a, T, L, LibcAlloc> {
-        // SAFETY: The caller upholds this function's `# Safety` contract, which matches
-        // that of `as_vec_mut_in`.
-        // The only additional requirement is allocator compatibility, which is an invariant of
-        // `CBufPtr<T, LibcAlloc>` and the fact that all instances of `LibcAlloc` are equivalent.
+        // SAFETY: By this function's `# Safety` contract, if `self.ptr` is non-null it was
+        // allocated by `LibcAlloc` with layout `Layout::array::<T>((*len).max(1))` and `*len`
+        // initialized elements, if null then `*len == 0`, and neither the buffer nor `*len` is
+        // aliased while the returned `CVecRefMut` exists.
         unsafe { self.as_vec_mut_in(len, LibcAlloc) }
     }
 
@@ -554,24 +598,27 @@ impl<T> CBufPtr<T, LibcAlloc> {
     ///
     /// # Safety
     ///
-    /// - This pointer is tracked with length and capacity.
-    /// - `*cap` is the number of elements the allocation pointed to by `self.ptr` can hold (or 0 if
-    ///   `self.ptr` is null).
-    /// - `*len` is the number of initialized elements, and `*len <= *cap`.
+    /// The caller must ensure that:
+    /// - If `self.ptr` is non-null, it was allocated by [`LibcAlloc`] with layout
+    ///   `Layout::array::<T>((*cap).max(1))`, `*len <= *cap`, and the first `*len` elements are
+    ///   initialized `T` values.
+    /// - If `self.ptr` is null, `*cap` and `*len` are `0`.
+    /// - While the returned [`CVecRefMut`] exists, the buffer, `*len`, and `*cap` are not accessed
+    ///   through any other pointer.
     ///
     /// # Panics
     ///
     /// Panics if `*len` or `*cap` is negative, if `*cap` exceeds the maximum safe slice
-    /// length, or if `*len > *cap`.
+    /// length, if `*len > *cap`, or if `self.ptr` is null and `*cap > 0`.
     pub unsafe fn as_vec_mut_with_cap<'a, L: CBufLen, C: CBufLen>(
         &'a mut self,
         len: &'a mut L,
         cap: &'a mut C,
     ) -> CVecRefMut<'a, T, L, LibcAlloc, C> {
-        // SAFETY: The caller upholds this function's `# Safety` contract, which matches
-        // that of `as_vec_mut_with_cap_in`.
-        // The only additional requirement is allocator compatibility, which is an invariant of
-        // `CBufPtr<T, LibcAlloc>` and the fact that all instances of `LibcAlloc` are equivalent.
+        // SAFETY: By this function's `# Safety` contract, if `self.ptr` is non-null it was
+        // allocated by `LibcAlloc` with layout `Layout::array::<T>((*cap).max(1))` and
+        // `*len <= *cap` initialized elements, if null then `*cap == 0` and `*len == 0`, and the
+        // buffer, `*len`, and `*cap` are unaliased while the returned `CVecRefMut` exists.
         unsafe { self.as_vec_mut_with_cap_in(len, cap, LibcAlloc) }
     }
 
@@ -599,7 +646,9 @@ impl<T> CBufPtr<T, LibcAlloc> {
     }
 }
 
-// SAFETY: `CBufPtr` is an owning pointer, so it is `Send` if `T` is `Send`.
+// SAFETY: `CBufPtr<T, A>` logically owns an array of `T` values (and holds `A` only in
+// `PhantomData<A>`), so transferring `CBufPtr<T, A>` across thread boundaries is sound whenever
+// `T: Send`.
 unsafe impl<T: Send, A> Send for CBufPtr<T, A> {}
 
 impl<T, A> fmt::Debug for CBufPtr<T, A> {
@@ -632,7 +681,11 @@ impl<T, A: Allocator> Default for CBufPtr<T, A> {
 /// - All references to the pointed-to data borrow through this `OwnedCBufPtr`.
 #[repr(transparent)]
 #[derive(Debug, Default)]
-pub struct OwnedCBufPtr<T: Copy, A: DropByPtrAllocator = LibcAlloc>(CBufPtr<T, A>);
+pub struct OwnedCBufPtr<T: Copy, A: DropByPtrAllocator = LibcAlloc>(
+    // Safety invariant: If non-null, `0` uniquely owns a live heap allocation created by `A` that
+    // can be freed via `A::deallocate_by_ptr`.
+    CBufPtr<T, A>,
+);
 
 impl<T: Copy, A: DropByPtrAllocator> Drop for OwnedCBufPtr<T, A> {
     fn drop(&mut self) {
@@ -661,12 +714,14 @@ impl<T: Copy, A: DropByPtrAllocator> OwnedCBufPtr<T, A> {
     ///
     /// # Safety
     ///
-    /// - `raw` satisfies all the safety invariants of [`CBufPtr<T, A>`].
+    /// The caller must ensure that:
+    /// - `raw` satisfies all the safety invariants of [`CBufPtr<T, A>`] (either null, or non-null,
+    ///   properly aligned for `T`, and allocated by `A`).
     /// - If `raw` is non-null, ownership of that allocation is transferred to the returned
-    ///   `OwnedCBufPtr`. There are no other references to the allocation.
+    ///   `OwnedCBufPtr`, and no other pointer or reference accesses or frees the allocation.
     pub const unsafe fn from_raw(raw: *mut T) -> Self {
-        // SAFETY: The caller guarantees that `raw` satisfies all safety invariants of `CBufPtr<T,
-        // A>` and transfers ownership of the allocation to this `OwnedCBufPtr`.
+        // SAFETY: By this function's `# Safety` contract, `raw` is either null or a non-null,
+        // aligned pointer allocated by `A` with exclusive ownership transferred to `Self`.
         Self(unsafe { CBufPtr::from_raw(raw) })
     }
 
@@ -743,7 +798,6 @@ impl<T: Copy, A: DropByPtrAllocator> DerefMut for OwnedCBufPtr<T, A> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::undocumented_unsafe_blocks)]
     use super::*;
     use crate::testing::*;
     use core::cell::Cell;
@@ -758,6 +812,7 @@ mod tests {
     #[gtest]
     fn with_len_null_ptr() {
         let ptr = CBufPtr::<i32>::null();
+        // SAFETY: `len` is 0, so `with_len` returns `&[]` without dereferencing `ptr`.
         let s = unsafe { ptr.with_len(0) };
         assert_that!(s.len(), eq(0));
         assert!(s.is_empty());
@@ -766,11 +821,13 @@ mod tests {
     #[gtest]
     fn with_len_nonnull_ptr_zero_len() {
         // Simulate a C struct where a buffer was allocated but len is 0.
-        let raw_ptr = unsafe { libc::malloc(16) } as *mut i32;
-        let ptr = unsafe { CBufPtr::from_raw(raw_ptr) };
+        let ptr = malloc_uninit_i32_buf();
+        // SAFETY: `len` is 0, so `with_len` returns `&[]` without reading any elements.
         let s = unsafe { ptr.with_len(0) };
         assert_that!(s.len(), eq(0));
         assert!(s.is_empty());
+        // SAFETY: `ptr` was allocated by `libc::malloc` via `malloc_uninit_i32_buf` and is not used
+        // after this call.
         unsafe { free_array(ptr) };
     }
 
@@ -778,25 +835,31 @@ mod tests {
     #[should_panic(expected = "CBufPtr: len is negative")]
     fn with_len_negative_len() {
         let ptr = CBufPtr::<i32>::null();
+        // SAFETY: `with_len` checks `len >= 0` before performing any unsafe operations and panics
+        // here as tested.
         let _ = unsafe { ptr.with_len(-5) };
     }
 
     #[gtest]
     fn with_len_deref() {
-        let (ptr, len) = unsafe { malloc_array([10, 20, 30]) };
+        let (ptr, len) = malloc_array([10, 20, 30]);
+        // SAFETY: `ptr` points to `len` initialized `i32` elements allocated by `malloc_array`.
         let s = unsafe { ptr.with_len(len) };
         assert_that!(s, container_eq([10, 20, 30]));
         assert_that!(s.len(), eq(3));
         assert!(!s.is_empty());
+        // SAFETY: `ptr` was allocated by `malloc_array` and is not used after this call.
         unsafe { free_array(ptr) };
     }
 
     #[gtest]
     fn with_len_into_iterator() {
-        let (ptr, len) = unsafe { malloc_array([1, 2, 3]) };
+        let (ptr, len) = malloc_array([1, 2, 3]);
+        // SAFETY: `ptr` points to `len` initialized `i32` elements allocated by `malloc_array`.
         let s = unsafe { ptr.with_len(len) };
         let collected: Vec<&i32> = s.iter().collect();
         assert_that!(collected, container_eq([&1, &2, &3]));
+        // SAFETY: `ptr` was allocated by `malloc_array` and is not used after this call.
         unsafe { free_array(ptr) };
     }
 
@@ -813,8 +876,10 @@ mod tests {
         let cloned = CBufPtr::try_clone_and_leak(&src).unwrap();
         assert!(!cloned.is_null());
         // Verify cloned data is independent.
+        // SAFETY: `cloned` is non-null, aligned, and points to 3 initialized `i32`s.
         let cloned_slice = unsafe { core::slice::from_raw_parts(cloned.as_ptr(), 3) };
         assert_that!(cloned_slice, container_eq([100, 200, 300]));
+        // SAFETY: `cloned` was allocated by `LibcAlloc` and is not used after this call.
         unsafe {
             free_array(cloned);
         }
@@ -828,13 +893,13 @@ mod tests {
         assert!(!cloned.is_null());
         assert_that!(alloc.alloc_count.load(Ordering::SeqCst), eq(1));
 
-        // SAFETY: `cloned` has 3 elements.
+        // SAFETY: `cloned` is non-null, aligned, and points to 3 initialized `i32`s.
         let cloned_slice = unsafe { core::slice::from_raw_parts(cloned.as_ptr(), 3) };
         assert_that!(cloned_slice, container_eq([10, 20, 30]));
 
         let mut count: c_int = 3;
         let mut ptr = cloned;
-        // SAFETY: `ptr` was allocated via `alloc` with `count` elements.
+        // SAFETY: `ptr` was allocated via `alloc` with `count` initialized elements.
         let mut handle = unsafe { ptr.as_vec_mut_in(&mut count, &alloc) };
         handle.clear();
         assert_that!(alloc.dealloc_count.load(Ordering::SeqCst), eq(1));
@@ -894,6 +959,7 @@ mod tests {
         v.resize(1024, 42u8);
         let ptr = OwnedCBufPtr::from_boxed_slice(v.into_boxed_slice());
         assert!(!ptr.is_null());
+        // SAFETY: `ptr` was created from a boxed slice of 1024 initialized `u8` elements.
         assert!(unsafe { ptr.with_len(1024) }.iter().all(|&b| b == 42));
     }
 
@@ -904,6 +970,7 @@ mod tests {
     #[gtest]
     fn cslice_with_len_mut_null_ptr() {
         let mut ptr = CBufPtr::<i32>::null();
+        // SAFETY: `len` is 0, so `with_len_mut` returns `&mut []` without dereferencing `ptr`.
         let slice = unsafe { ptr.with_len_mut(0) };
         assert_that!(slice.len(), eq(0));
         assert!(slice.is_empty());
@@ -911,46 +978,56 @@ mod tests {
 
     #[gtest]
     fn cslice_with_len_mut_nonnull_ptr_zero_len() {
-        let mut ptr = unsafe { CBufPtr::from_raw(libc::malloc(16) as *mut i32) };
+        let mut ptr = malloc_uninit_i32_buf();
+        // SAFETY: `len` is 0, so `with_len_mut` returns `&mut []` without reading any elements.
         let slice = unsafe { ptr.with_len_mut(0) };
         assert_that!(slice.len(), eq(0));
         assert!(slice.is_empty());
+        // SAFETY: `ptr` was allocated by `libc::malloc` via `malloc_uninit_i32_buf` and is not used
+        // after this call.
         unsafe { free_array(ptr) };
     }
 
     #[gtest]
     fn cslice_with_len_mut_read() {
-        let (mut ptr, len) = unsafe { malloc_array([5, 6, 7]) };
+        let (mut ptr, len) = malloc_array([5, 6, 7]);
+        // SAFETY: `ptr` points to `len` initialized `i32` elements allocated by `malloc_array`.
         let slice = unsafe { ptr.with_len_mut(len) };
         assert_that!(&*slice, container_eq([5, 6, 7]));
         assert_that!(slice.len(), eq(3));
+        // SAFETY: `ptr` was allocated by `malloc_array` and is not used after this call.
         unsafe { free_array(ptr) };
     }
 
     #[gtest]
     fn cslice_with_len_mut_modify() {
-        let (mut ptr, len) = unsafe { malloc_array([1, 2, 3]) };
+        let (mut ptr, len) = malloc_array([1, 2, 3]);
+        // SAFETY: `ptr` points to `len` initialized `i32` elements allocated by `malloc_array`.
         let slice = unsafe { ptr.with_len_mut(len) };
         slice[0] = 99;
         assert_that!(&*slice, container_eq([99, 2, 3]));
+        // SAFETY: `ptr` was allocated by `malloc_array` and is not used after this call.
         unsafe { free_array(ptr) };
     }
 
     #[gtest]
     fn cslice_with_len_mut_into_iterator() {
-        let (mut ptr, len) = unsafe { malloc_array([1, 2, 3]) };
+        let (mut ptr, len) = malloc_array([1, 2, 3]);
+        // SAFETY: `ptr` points to `len` initialized `i32` elements allocated by `malloc_array`.
         let slice = unsafe { ptr.with_len_mut(len) };
         let collected: Vec<&mut i32> = slice.iter_mut().collect();
         assert_that!(collected.len(), eq(3));
         assert_that!(*collected[0], eq(1));
         assert_that!(*collected[1], eq(2));
         assert_that!(*collected[2], eq(3));
+        // SAFETY: `ptr` was allocated by `malloc_array` and is not used after this call.
         unsafe { free_array(ptr) };
     }
 
     #[gtest]
     fn cslice_with_len_mut_into_iterator_empty() {
         let mut ptr = CBufPtr::<i32>::null();
+        // SAFETY: `len` is 0, so `with_len_mut` returns `&mut []` without dereferencing `ptr`.
         let slice = unsafe { ptr.with_len_mut(0) };
         let collected: Vec<&mut i32> = slice.iter_mut().collect();
         assert_that!(collected.len(), eq(0));
@@ -960,6 +1037,8 @@ mod tests {
     #[should_panic(expected = "CBufPtr: len is negative")]
     fn cslice_with_len_mut_negative_len() {
         let mut ptr = CBufPtr::<i32>::null();
+        // SAFETY: `with_len_mut` checks `len >= 0` before performing any unsafe operations and
+        // panics here as tested.
         let _ = unsafe { ptr.with_len_mut(-5) };
     }
 
@@ -972,12 +1051,16 @@ mod tests {
         let result = malloc_array_typed::<i32, usize, 3>([10, 20, 30]);
         assert!(result.is_ok());
         let (ptr, len) = result.unwrap();
+        // SAFETY: `ptr` points to `len` initialized `i32` elements allocated by
+        // `malloc_array_typed`.
         let s = unsafe { ptr.with_len(len) };
         assert_that!(s, container_eq([10, 20, 30]));
         assert_that!(s.len(), eq(3));
+        // SAFETY: `ptr` was allocated by `malloc_array_typed` and is not used after this call.
         unsafe { free_array(ptr) };
 
         let null_ptr = CBufPtr::<i32>::null();
+        // SAFETY: `len` is 0, so `with_len` returns `&[]` without dereferencing `null_ptr`.
         let empty = unsafe { null_ptr.with_len(0usize) };
         assert!(empty.is_empty());
     }
@@ -1001,6 +1084,7 @@ mod tests {
     fn c_buf_ptr_as_vec_mut_libc() {
         let mut ptr = CBufPtr::<i32>::null();
         let mut count: c_int = 0;
+        // SAFETY: `ptr` is null and `count` is 0.
         let mut handle = unsafe { ptr.as_vec_mut(&mut count) };
         handle.push_back(123);
         assert_that!(&*handle, container_eq([123]));
@@ -1014,6 +1098,8 @@ mod tests {
     fn c_buf_ptr_as_vec_mut_negative_len() {
         let mut ptr = CBufPtr::<i32>::null();
         let mut count: c_int = -5;
+        // SAFETY: `as_vec_mut` checks `count >= 0` before performing any unsafe operations and
+        // panics here as tested.
         let _ = unsafe { ptr.as_vec_mut(&mut count) };
     }
 
@@ -1022,6 +1108,8 @@ mod tests {
     fn c_buf_ptr_as_vec_mut_null_ptr_non_zero_len() {
         let mut ptr = CBufPtr::<i32>::null();
         let mut count: c_int = 5;
+        // SAFETY: `as_vec_mut` checks that a null pointer has `count == 0` before performing any
+        // unsafe operations and panics here as tested.
         let _ = unsafe { ptr.as_vec_mut(&mut count) };
     }
 
@@ -1040,6 +1128,9 @@ mod tests {
     #[derive(Default, Clone, Copy, Debug)]
     struct GlobalTrackingAlloc;
 
+    // SAFETY: `GlobalTrackingAlloc` delegates all allocation and deallocation operations to
+    // `LibcAlloc` while incrementing thread-local counters, preserving `LibcAlloc`'s `Allocator`
+    // guarantees.
     unsafe impl Allocator for GlobalTrackingAlloc {
         fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
             ALLOC_COUNT.set(ALLOC_COUNT.get() + 1);
@@ -1048,6 +1139,8 @@ mod tests {
 
         unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
             DEALLOC_COUNT.set(DEALLOC_COUNT.get() + 1);
+            // SAFETY: The caller upholds the `Allocator::deallocate` safety contract for `ptr` and
+            // `layout`, which was allocated by `LibcAlloc` through `GlobalTrackingAlloc`.
             unsafe { LibcAlloc.deallocate(ptr, layout) };
         }
     }
@@ -1055,6 +1148,8 @@ mod tests {
     impl DropByPtrAllocator for GlobalTrackingAlloc {
         unsafe fn deallocate_by_ptr(ptr: NonNull<u8>) {
             DEALLOC_COUNT.set(DEALLOC_COUNT.get() + 1);
+            // SAFETY: The caller upholds the `DropByPtrAllocator::deallocate_by_ptr` safety
+            // contract for `ptr`, which was allocated by `LibcAlloc` through `GlobalTrackingAlloc`.
             unsafe { LibcAlloc::deallocate_by_ptr(ptr) };
         }
     }
@@ -1078,6 +1173,7 @@ mod tests {
         let owned = OwnedCBufPtr::<i32>::null();
         assert!(owned.is_null());
         assert!(owned.as_ptr().is_null());
+        // SAFETY: `len` is 0, so `with_len` returns `&[]` without dereferencing `owned`.
         let slice = unsafe { owned.with_len(0) };
         assert!(slice.is_empty());
         // Dropping null OwnedCBufPtr must be safe.
@@ -1085,17 +1181,22 @@ mod tests {
 
     #[gtest]
     fn owned_c_buf_ptr_from_raw_and_drop_libc() {
-        let (ptr, len) = unsafe { malloc_array([10, 20, 30]) };
+        let (ptr, len) = malloc_array([10, 20, 30]);
+        // SAFETY: `ptr` was allocated by `LibcAlloc` via `malloc_array` and ownership is
+        // transferred to `owned`.
         let mut owned: OwnedCBufPtr<_> = unsafe { OwnedCBufPtr::from_raw(ptr.as_ptr()) };
         assert!(!owned.is_null());
 
         // Test Deref to CBufPtr
+        // SAFETY: `owned` points to `len` initialized `i32` elements.
         let slice = unsafe { owned.with_len(len) };
         assert_that!(slice, container_eq([10, 20, 30]));
 
         // Test DerefMut to CBufPtr
+        // SAFETY: `owned` points to `len` initialized `i32` elements and is exclusively borrowed.
         let slice_mut = unsafe { owned.with_len_mut(len) };
         slice_mut[1] = 200;
+        // SAFETY: `owned` points to `len` initialized `i32` elements.
         assert_that!(unsafe { owned.with_len(len) }, container_eq([10, 200, 30]));
 
         // Test Debug formatting
@@ -1113,14 +1214,19 @@ mod tests {
         assert_that!(DEALLOC_COUNT.get(), eq(0));
 
         {
+            // SAFETY: `cloned` was allocated by `GlobalTrackingAlloc` and ownership is transferred
+            // to `owned`.
             let mut owned =
                 unsafe { OwnedCBufPtr::<i32, GlobalTrackingAlloc>::from_raw(cloned.as_ptr()) };
             assert!(!owned.is_null());
 
+            // SAFETY: `owned` points to 4 initialized `i32` elements.
             assert_that!(unsafe { owned.with_len(4) }, container_eq([1, 2, 3, 4]));
+            // SAFETY: `owned` points to 4 initialized `i32` elements and is exclusively borrowed.
             unsafe {
                 owned.with_len_mut(4)[0] = 42;
             };
+            // SAFETY: `owned` points to 4 initialized `i32` elements.
             assert_that!(unsafe { owned.with_len(4) }, container_eq([42, 2, 3, 4]));
         }
 
@@ -1134,21 +1240,29 @@ mod tests {
         DEALLOC_COUNT.set(0);
 
         let cloned = CBufPtr::try_clone_and_leak_in(&[5, 6, 7], GlobalTrackingAlloc).unwrap();
+        // SAFETY: `cloned` was allocated by `GlobalTrackingAlloc` and ownership is transferred to
+        // `owned`.
         let owned = unsafe { OwnedCBufPtr::<i32, GlobalTrackingAlloc>::from_raw(cloned.as_ptr()) };
 
         // Consuming owned via into_c_buf_ptr should not deallocate.
         let buf_ptr: CBufPtr<i32, GlobalTrackingAlloc> = owned.into_c_buf_ptr();
         assert_that!(DEALLOC_COUNT.get(), eq(0));
+        // SAFETY: `buf_ptr` points to 3 initialized `i32` elements.
         assert_that!(unsafe { buf_ptr.with_len(3) }, container_eq([5, 6, 7]));
 
         // Re-wrap and test into_raw.
+        // SAFETY: `buf_ptr` was allocated by `GlobalTrackingAlloc` and ownership is transferred to
+        // `owned2`.
         let owned2 =
             unsafe { OwnedCBufPtr::<i32, GlobalTrackingAlloc>::from_raw(buf_ptr.as_ptr()) };
         let raw = owned2.into_raw();
         assert_that!(DEALLOC_COUNT.get(), eq(0));
+        // SAFETY: `raw` is non-null, aligned, and points to 3 initialized `i32` elements.
         assert_that!(unsafe { core::slice::from_raw_parts(raw, 3) }, container_eq([5, 6, 7]));
 
         // Re-wrap and drop to verify cleanup.
+        // SAFETY: `raw` was allocated by `GlobalTrackingAlloc` and ownership is transferred to
+        // `owned3`.
         let owned3 = unsafe { OwnedCBufPtr::<i32, GlobalTrackingAlloc>::from_raw(raw) };
         drop(owned3);
         assert_that!(DEALLOC_COUNT.get(), eq(1));
@@ -1161,6 +1275,7 @@ mod tests {
         assert!(!owned.is_null());
         // The buffer is an independent copy.
         assert!(!core::ptr::eq(owned.as_ptr(), src.as_ptr()));
+        // SAFETY: `owned` was cloned from `src` and contains `src.len()` initialized elements.
         assert_that!(unsafe { owned.with_len(src.len()) }, container_eq(src));
     }
 
@@ -1177,6 +1292,7 @@ mod tests {
 
         let owned = OwnedCBufPtr::clone_from_slice_in(&[1, 2, 3, 4], GlobalTrackingAlloc);
         assert_that!(ALLOC_COUNT.get(), eq(1));
+        // SAFETY: `owned` was cloned from a 4-element slice and contains 4 initialized `i32`s.
         assert_that!(unsafe { owned.with_len(4) }, container_eq([1, 2, 3, 4]));
 
         drop(owned);
