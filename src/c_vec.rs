@@ -69,11 +69,23 @@ const fn min_non_zero_cap<T>() -> usize {
 /// - `alloc` is the allocator used for all allocations.
 /// - `capacity` is `Some` if and only if this handle tracks capacity.
 pub struct CVecRefMut<'a, T, L: CBufLen, A: Allocator = LibcAlloc, C: CBufLen = L> {
+    // Safety invariant: Let `cap` be the non-negative `usize` value of `*capacity` when `capacity`
+    // is `Some`, or the non-negative `usize` value of `*len` when `capacity` is `None`. Either
+    // `ptr` is null and `cap == 0`, or `ptr` is non-null, aligned for `T`, and points to a live
+    // allocation of `cap.max(1)` elements of `T` created by `alloc` with
+    // `cap <= isize::MAX as usize / size_of::<T>()` and the first `*len` elements initialized.
     pub(crate) ptr: &'a mut CBufPtr<T, A>,
+    // Safety invariant: `*len` converts via `L::try_into` to `Ok(n)` where `0 <= n <= cap` is the
+    // exact number of initialized leading `T` elements at `ptr`.
     pub(crate) len: &'a mut L,
+    // Safety invariant: When `Some(c)`, `*c` converts via `C::try_into` to `Ok(cap)` where
+    // `cap >= len` and `cap <= isize::MAX as usize / size_of::<T>()` is the element capacity of
+    // the allocation at `ptr` (or `0` when `ptr` is null).
     /// Optional capacity field. When `Some`, the allocation holds `*capacity`
     /// elements; when `None`, the allocation holds exactly `*len` elements.
     pub(crate) capacity: Option<&'a mut C>,
+    // Safety invariant: `alloc` is the allocator instance that created (and must resize/free) any
+    // non-null allocation stored in `*ptr`.
     pub(crate) alloc: A,
 }
 
@@ -86,13 +98,13 @@ impl<'a, T, L: CBufLen, A: Allocator, C: CBufLen> CVecRefMut<'a, T, L, A, C> {
             return &[];
         }
         // SAFETY:
-        // - Since `ptr` is not null, the invariants for `CBufPtr` guarantee that `ptr` points to an
-        //   owned array of `T`s, and that the pointer is aligned for `T`.
-        // - `CBufPtr` owns the underlying array, so the pointer is valid for reads for the lifetime
-        //   of this object (&self, created from a `CBufPtr`).
-        // - The invariant for `CVecRefMut` guarantees that `len` is the valid length of the array
-        //   (as per CBufLen's safety contract) pointed to by `ptr`.
+        // - By the safety-usable invariant of `self.len()` and the field safety invariants of
+        //   `CVecRefMut`, since `!self.ptr.is_null()` and `len > 0`, `self.ptr` is non-null,
+        //   properly aligned for `T`, and points to `len` consecutive initialized `T` elements
+        //   within a single live allocation of size `len * size_of::<T>() <= isize::MAX as usize`.
         // - `L: CBufLen` guarantees that `try_into()` is deterministic and pure.
+        // - The shared borrow `&self` prevents any mutation of the underlying elements for the
+        //   lifetime of the returned `&[T]` slice.
         unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), len) }
     }
 
@@ -104,13 +116,13 @@ impl<'a, T, L: CBufLen, A: Allocator, C: CBufLen> CVecRefMut<'a, T, L, A, C> {
             return &mut [];
         }
         // SAFETY:
-        // - Since `ptr` is not null, the invariants for `CBufPtr` guarantee that `ptr` points to an
-        //   owned array of `T`s, and that the pointer is aligned for `T`.
-        // - `CBufPtr` owns the underlying array, so the pointer is valid for reads for the lifetime
-        //   of this object (&self, created from a `CBufPtr`).
-        // - The invariant for `CVecRefMut` guarantees that `len` is the valid length of the array
-        //   pointed to by `ptr`.
+        // - By the safety-usable invariant of `self.len()` and the field safety invariants of
+        //   `CVecRefMut`, since `!self.ptr.is_null()` and `len > 0`, `self.ptr` is non-null,
+        //   properly aligned for `T`, and points to `len` consecutive initialized `T` elements
+        //   within a single live allocation of size `len * size_of::<T>() <= isize::MAX as usize`.
         // - `L: CBufLen` guarantees that `try_into()` is deterministic and pure.
+        // - The exclusive borrow `&mut self` guarantees no other reference aliases the elements for
+        //   the lifetime of the returned `&mut [T]` slice.
         unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), len) }
     }
 
@@ -121,6 +133,12 @@ impl<'a, T, L: CBufLen, A: Allocator, C: CBufLen> CVecRefMut<'a, T, L, A, C> {
     }
 
     /// Return the number of elements in the vector.
+    ///
+    /// # Safety-usable invariant
+    ///
+    /// Returns the exact number `n` of initialized leading `T` elements in `self.ptr`, with
+    /// `n <= self.capacity().unwrap_or(n) <= isize::MAX as usize / size_of::<T>()`, and if `n > 0`,
+    /// `self.ptr` is non-null.
     #[inline]
     pub fn len(&self) -> usize {
         (*self.len).try_into().expect("CVecRefMut: len is negative")
@@ -136,6 +154,12 @@ impl<'a, T, L: CBufLen, A: Allocator, C: CBufLen> CVecRefMut<'a, T, L, A, C> {
     /// or `None` if this handle does not track capacity separately from length.
     ///
     /// When `None`, the allocation always holds exactly [`len`](Self::len) elements.
+    ///
+    /// # Safety-usable invariant
+    ///
+    /// When `Some(cap)`, `self.len() <= cap <= isize::MAX as usize / size_of::<T>()`, and if
+    /// `cap > 0`, `self.ptr` is non-null and points to an allocation of `cap` elements of `T`
+    /// created by `self.alloc`.
     #[inline]
     pub fn capacity(&self) -> Option<usize> {
         self.capacity.as_ref().map(|c| (**c).try_into().expect("CVecRefMut: capacity is negative"))
@@ -201,8 +225,10 @@ impl<'a, T, L: CBufLen, A: Allocator, C: CBufLen> CVecRefMut<'a, T, L, A, C> {
             };
 
             let alloc_result = match NonNull::new(self.ptr.as_ptr() as *mut u8) {
-                // SAFETY: If `old_ptr` is non-null, it was allocated by `self.alloc` with
-                // `old_layout` (`old_cap` elements, or `old_len` when capacity is untracked).
+                // SAFETY: By `CVecRefMut`'s field invariants, when `old_ptr` is non-null, it is
+                // currently allocated via `self.alloc` with `old_layout`, and `new_cap >=
+                // old_cap.unwrap_or(old_len).max(1)` implies `new_layout.size() >=
+                // old_layout.size()`, satisfying `Allocator::grow`.
                 Some(old_ptr) => unsafe { self.alloc.grow(old_ptr, old_layout, new_layout) },
                 None => self.alloc.allocate(new_layout),
             };
@@ -210,17 +236,23 @@ impl<'a, T, L: CBufLen, A: Allocator, C: CBufLen> CVecRefMut<'a, T, L, A, C> {
                 core::hint::cold_path();
                 return Err(value);
             };
-            // SAFETY: `new_ptr` is non-null and points to an allocation of `new_cap`
-            // elements of `T`.
+            // SAFETY: `new_ptr` was returned by `self.alloc` for `new_layout`
+            // (`Layout::array::<T>(new_cap)`), so `new_ptr.as_ptr() as *mut T` is
+            // non-null, aligned for `T`, and allocated by `A`.
             *self.ptr = unsafe { CBufPtr::from_raw(new_ptr.as_ptr() as *mut T) };
             if let Some(cap) = self.capacity.as_deref_mut() {
                 *cap = new_cap_val;
             }
         }
 
-        // SAFETY: By the safety invariant of `CVecRefMut` the allocation is correctly aligned and
-        // has room for at least `new_len` elements, i.e. it is valid to write to index `old_len`.
-        unsafe { ptr::write(self.ptr.as_ptr().add(old_len), value) };
+        // SAFETY: By `CVecRefMut`'s field invariants and the reallocation branch above, `self.ptr`
+        // is non-null and points to a live allocation of at least `new_len = old_len + 1` elements
+        // of `T` (`new_len * size_of::<T>() <= isize::MAX as usize`), so offsetting by `old_len`
+        // remains in bounds of that allocation without wrapping.
+        let dst = unsafe { self.ptr.as_ptr().add(old_len) };
+        // SAFETY: `dst` is non-null, aligned for `T`, and points to the uninitialized slot at index
+        // `old_len` within the exclusively owned allocation.
+        unsafe { ptr::write(dst, value) };
         *self.len = new_len_val;
         Ok(())
     }
@@ -257,13 +289,19 @@ impl<'a, T, L: CBufLen, A: Allocator, C: CBufLen> CVecRefMut<'a, T, L, A, C> {
             // even if `ptr::drop_in_place` panics while dropping the elements.
             // This prevents leaking the underlying allocation.
             struct AllocDropGuard<'g, A: Allocator> {
+                // Safety invariant: `alloc` is the allocator instance that created `ptr`.
                 alloc: &'g A,
+                // Safety invariant: `ptr` is a live block of memory allocated by `alloc` with
+                // `layout` that is exclusively owned by this guard and has not yet been freed.
                 ptr: NonNull<u8>,
+                // Safety invariant: `layout` is the exact `Layout` used to allocate `ptr`.
                 layout: Layout,
             }
             impl<'g, A: Allocator> Drop for AllocDropGuard<'g, A> {
                 fn drop(&mut self) {
-                    // SAFETY: `self.ptr` was allocated via `self.alloc` with `self.layout`.
+                    // SAFETY: By `AllocDropGuard`'s field safety invariants, `self.ptr` is
+                    // currently allocated via `self.alloc` with `self.layout`, and no active
+                    // references to the block remain when `AllocDropGuard::drop` runs.
                     unsafe { self.alloc.deallocate(self.ptr, self.layout) };
                 }
             }
@@ -274,8 +312,11 @@ impl<'a, T, L: CBufLen, A: Allocator, C: CBufLen> CVecRefMut<'a, T, L, A, C> {
 
             if len > 0 {
                 let slice = ptr::slice_from_raw_parts_mut(old_ptr.as_ptr(), len);
-                // SAFETY: `old_ptr` points to `n` valid elements.
-                // Run `Drop` impls on all elements (see `cslice_ref_mut_clear_drops_elements`).
+                // SAFETY: By `CVecRefMut`'s field invariants prior to resetting `self.ptr`,
+                // `old_ptr` is non-null, aligned for `T`, and points to `len` consecutive
+                // initialized `T` elements in a single live allocation exclusively owned by this
+                // call. `_guard` only deallocates the raw storage after `drop_in_place` completes
+                // (or unwinds), so the elements are never dropped twice.
                 unsafe { ptr::drop_in_place(slice) };
             } else {
                 core::hint::cold_path();
@@ -331,8 +372,6 @@ impl<T: core::fmt::Debug, L: CBufLen, A: Allocator, C: CBufLen> core::fmt::Debug
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::undocumented_unsafe_blocks)]
-
     use super::*;
     use crate::testing::*;
     use core::sync::atomic::{AtomicU8, Ordering};
@@ -343,6 +382,7 @@ mod tests {
     fn c_vec_ref_mut_null_ptr() {
         let mut ptr = CBufPtr::<i32>::null();
         let mut len: c_int = 0;
+        // SAFETY: `ptr` is null and `len` is `0`.
         let handle = unsafe { ptr.as_vec_mut(&mut len) };
         assert_that!(handle.len(), eq(0));
         assert!(handle.is_empty());
@@ -352,8 +392,10 @@ mod tests {
     fn c_vec_ref_mut_nonnull_ptr_zero_len() {
         // Simulate a C struct where a buffer was allocated but len is 0.
         // clear() must still free the buffer.
-        let mut ptr = unsafe { CBufPtr::<i32>::from_raw(libc::malloc(16) as *mut i32) };
+        let mut ptr = malloc_uninit_i32_buf();
         let mut len: c_int = 0;
+        // SAFETY: `ptr` was allocated by `LibcAlloc` with 16 bytes (`>= Layout::array::<i32>(1)`)
+        // and `len` is `0` initialized elements.
         let mut handle = unsafe { ptr.as_vec_mut(&mut len) };
         assert_that!(handle.len(), eq(0));
         assert!(handle.is_empty());
@@ -366,8 +408,10 @@ mod tests {
     fn c_vec_ref_mut_nonnull_ptr_zero_len_push_back() {
         // Simulate a C struct where a buffer was allocated but len is 0.
         // push_back() must free the previous buffer and grow properly.
-        let mut ptr = unsafe { CBufPtr::<i32>::from_raw(libc::malloc(16) as *mut i32) };
+        let mut ptr = malloc_uninit_i32_buf();
         let mut len: c_int = 0;
+        // SAFETY: `ptr` was allocated by `LibcAlloc` with 16 bytes (`>= Layout::array::<i32>(1)`)
+        // and `len` is `0` initialized elements.
         let mut handle = unsafe { ptr.as_vec_mut(&mut len) };
         handle.push_back(123);
         assert_that!(&*handle, container_eq([123]));
@@ -378,7 +422,8 @@ mod tests {
 
     #[gtest]
     fn c_vec_ref_mut_deref() {
-        let (mut ptr, mut len) = unsafe { malloc_array([5, 6, 7]) };
+        let (mut ptr, mut len) = malloc_array([5, 6, 7]);
+        // SAFETY: `ptr` points to `len` (`3`) initialized `i32` elements allocated by `LibcAlloc`.
         let handle = unsafe { ptr.as_vec_mut(&mut len) };
         assert_that!(&*handle, container_eq([5, 6, 7]));
         assert_that!(handle.len(), eq(3));
@@ -390,7 +435,8 @@ mod tests {
 
     #[gtest]
     fn c_vec_ref_mut_deref_mut() {
-        let (mut ptr, mut len) = unsafe { malloc_array([1, 2, 3]) };
+        let (mut ptr, mut len) = malloc_array([1, 2, 3]);
+        // SAFETY: `ptr` points to `len` (`3`) initialized `i32` elements allocated by `LibcAlloc`.
         let mut handle = unsafe { ptr.as_vec_mut(&mut len) };
         handle[0] = 99;
         assert_that!(&*handle, container_eq([99, 2, 3]));
@@ -401,6 +447,7 @@ mod tests {
     fn c_vec_ref_mut_push_back_to_empty() {
         let mut ptr = CBufPtr::<i32>::null();
         let mut len: c_int = 0;
+        // SAFETY: `ptr` is null and `len` is `0`.
         let mut handle = unsafe { ptr.as_vec_mut(&mut len) };
         handle.push_back(42);
         assert_that!(&*handle, container_eq([42]));
@@ -413,7 +460,8 @@ mod tests {
 
     #[gtest]
     fn c_vec_ref_mut_push_back_to_existing() {
-        let (mut ptr, mut len) = unsafe { malloc_array([10]) };
+        let (mut ptr, mut len) = malloc_array([10]);
+        // SAFETY: `ptr` points to `len` (`1`) initialized `i32` element allocated by `LibcAlloc`.
         let mut handle = unsafe { ptr.as_vec_mut(&mut len) };
         handle.push_back(20);
         handle.push_back(30);
@@ -429,7 +477,7 @@ mod tests {
         let mut ptr = CBufPtr::null();
         let mut count: c_int = 0;
         {
-            // SAFETY: Null pointer with length 0 is safe.
+            // SAFETY: `ptr` is null and `count` is `0`.
             let mut handle = unsafe { ptr.as_vec_mut_in(&mut count, &alloc) };
             assert_that!(handle.allocator().alloc_count.load(Ordering::SeqCst), eq(0));
             handle.push_back(100);
@@ -451,11 +499,13 @@ mod tests {
         let alloc = TrackingAlloc::default();
         // Allocate a dummy buffer first.
         let slice = (&alloc).allocate(Layout::new::<i32>()).unwrap();
-        // SAFETY: ptr is valid and was just allocated, we don't modify it.
+        // SAFETY: `slice` was just allocated by `&alloc` with `Layout::new::<i32>()` (non-null and
+        // aligned for `i32`).
         let mut ptr = unsafe { CBufPtr::from_raw(slice.as_ptr() as *mut i32) };
         let mut count: c_int = 0;
         {
-            // SAFETY: ptr is non-null, count is 0, allocated via alloc.
+            // SAFETY: `ptr` is non-null, allocated via `&alloc`, and `count` is `0` initialized
+            // elements.
             let mut handle = unsafe { ptr.as_vec_mut_in(&mut count, &alloc) };
             assert_that!(alloc.alloc_count.load(Ordering::SeqCst), eq(1));
             assert_that!(alloc.grow_count.load(Ordering::SeqCst), eq(0));
@@ -476,8 +526,12 @@ mod tests {
     #[gtest]
     fn c_vec_ref_mut_try_push_back_overflow() {
         let mut dummy = 0i32;
+        // SAFETY: `&mut dummy` is non-null and aligned for `i32`; `try_push_back` returns `Err` on
+        // `c_int::MAX` overflow before touching the pointer or allocator.
         let mut ptr = unsafe { CBufPtr::from_raw(&mut dummy) };
         let mut len: c_int = c_int::MAX;
+        // SAFETY: Test-only synthetic handle with `len == c_int::MAX`; `try_push_back` checks
+        // `L::try_from(old_len + 1)` and returns `Err` before dereferencing or reallocating `ptr`.
         let mut handle = unsafe { ptr.as_vec_mut(&mut len) };
         let result = handle.try_push_back(999);
         assert!(result.is_err());
@@ -486,7 +540,8 @@ mod tests {
 
     #[gtest]
     fn c_vec_ref_mut_clear_nonempty() {
-        let (mut ptr, mut len) = unsafe { malloc_array([1, 2, 3]) };
+        let (mut ptr, mut len) = malloc_array([1, 2, 3]);
+        // SAFETY: `ptr` points to `len` (`3`) initialized `i32` elements allocated by `LibcAlloc`.
         let mut handle = unsafe { ptr.as_vec_mut(&mut len) };
         handle.clear();
         assert_that!(handle.len(), eq(0));
@@ -496,11 +551,15 @@ mod tests {
 
     #[gtest]
     fn c_vec_ref_mut_swap() {
-        let (mut ptr1, mut len1) = unsafe { malloc_array([1, 2, 3]) };
-        let (mut ptr2, mut len2) = unsafe { malloc_array([4, 5]) };
+        let (mut ptr1, mut len1) = malloc_array([1, 2, 3]);
+        let (mut ptr2, mut len2) = malloc_array([4, 5]);
 
         {
+            // SAFETY: `ptr1` points to `len1` (`3`) initialized `i32` elements allocated by
+            // `LibcAlloc`.
             let mut handle1 = unsafe { ptr1.as_vec_mut(&mut len1) };
+            // SAFETY: `ptr2` points to `len2` (`2`) initialized `i32` elements allocated by
+            // `LibcAlloc`.
             let mut handle2 = unsafe { ptr2.as_vec_mut(&mut len2) };
 
             handle1.swap(&mut handle2);
@@ -512,14 +571,18 @@ mod tests {
         // Verify that the underlying values were swapped.
         assert_that!(len1, eq(2));
         assert_that!(len2, eq(3));
-        // SAFETY: `ptr1` has `len1` (2) elements after swap.
+        // SAFETY: After `swap`, `ptr1` points to `len1` (`2`) initialized `i32` elements.
         assert_that!(unsafe { ptr1.with_len(len1) }, container_eq([4, 5]));
-        // SAFETY: `ptr2` has `len2` (3) elements after swap.
+        // SAFETY: After `swap`, `ptr2` points to `len2` (`3`) initialized `i32` elements.
         assert_that!(unsafe { ptr2.with_len(len2) }, container_eq([1, 2, 3]));
 
         // Clean up both handles.
+        // SAFETY: `ptr1` points to `len1` (`2`) initialized `i32` elements allocated by
+        // `LibcAlloc`.
         let mut handle1 = unsafe { ptr1.as_vec_mut(&mut len1) };
         handle1.clear();
+        // SAFETY: `ptr2` points to `len2` (`3`) initialized `i32` elements allocated by
+        // `LibcAlloc`.
         let mut handle2 = unsafe { ptr2.as_vec_mut(&mut len2) };
         handle2.clear();
     }
@@ -535,9 +598,9 @@ mod tests {
         let mut len2: c_int = 0;
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            // SAFETY: Testing that swap panics when allocators differ.
+            // SAFETY: `ptr1` is null and `len1` is `0`.
             let mut handle1 = unsafe { ptr1.as_vec_mut_in(&mut len1, &alloc1) };
-            // SAFETY: Testing that swap panics when allocators differ.
+            // SAFETY: `ptr2` is null and `len2` is `0`.
             let mut handle2 = unsafe { ptr2.as_vec_mut_in(&mut len2, &alloc2) };
             handle1.swap(&mut handle2);
         }));
@@ -548,6 +611,7 @@ mod tests {
     fn c_vec_ref_mut_clear_already_empty() {
         let mut ptr = CBufPtr::<i32>::null();
         let mut len: c_int = 0;
+        // SAFETY: `ptr` is null and `len` is `0`.
         let mut handle = unsafe { ptr.as_vec_mut(&mut len) };
         // Clearing an already-empty slice should not panic.
         handle.clear();
@@ -565,7 +629,8 @@ mod tests {
             }
         }
 
-        let (mut ptr, mut len) = unsafe { malloc_array([Foo(1), Foo(2)]) };
+        let (mut ptr, mut len) = malloc_array([Foo(1), Foo(2)]);
+        // SAFETY: `ptr` points to `len` (`2`) initialized `Foo` elements allocated by `LibcAlloc`.
         let mut handle = unsafe { ptr.as_vec_mut(&mut len) };
 
         assert_that!(DROPPED.load(Ordering::Relaxed), eq(0));
@@ -584,8 +649,10 @@ mod tests {
             }
         }
 
-        let (mut ptr, mut len) = unsafe { malloc_array([PanickingDrop(1)]) };
+        let (mut ptr, mut len) = malloc_array([PanickingDrop(1)]);
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // SAFETY: `ptr` points to `len` (`1`) initialized `PanickingDrop` element allocated by
+            // `LibcAlloc`.
             let mut handle = unsafe { ptr.as_vec_mut(&mut len) };
             handle.clear();
         }));
@@ -599,6 +666,7 @@ mod tests {
     fn c_vec_ref_mut_usize() {
         let mut ptr = CBufPtr::<i32>::null();
         let mut len: usize = 0;
+        // SAFETY: `ptr` is null and `len` is `0`.
         let mut handle = unsafe { ptr.as_vec_mut(&mut len) };
         handle.push_back(100);
         handle.push_back(200);
@@ -613,6 +681,7 @@ mod tests {
     fn c_vec_ref_mut_u32() {
         let mut ptr = CBufPtr::<i32>::null();
         let mut len: u32 = 0;
+        // SAFETY: `ptr` is null and `len` is 0.
         let mut handle = unsafe { ptr.as_vec_mut(&mut len) };
         handle.push_back(42);
         assert_that!(&*handle, container_eq([42]));
@@ -625,6 +694,7 @@ mod tests {
     fn c_vec_ref_mut_u64() {
         let mut ptr = CBufPtr::<i32>::null();
         let mut len: u64 = 0;
+        // SAFETY: `ptr` is null and `len` is 0.
         let mut handle = unsafe { ptr.as_vec_mut(&mut len) };
         handle.push_back(77);
         assert_that!(&*handle, container_eq([77]));
@@ -638,6 +708,7 @@ mod tests {
         let mut ptr = CBufPtr::<i32>::null();
         let mut len: u8 = 0;
         {
+            // SAFETY: `ptr` is null and `len` is 0.
             let mut handle = unsafe { ptr.as_vec_mut(&mut len) };
             for i in 0..=254 {
                 assert!(handle.try_push_back(i as i32).is_ok());
@@ -664,7 +735,7 @@ mod tests {
         let mut len: c_int = 0;
         let mut cap: c_int = 0;
         {
-            // SAFETY: null pointer with len 0 and cap 0 is safe.
+            // SAFETY: `ptr` is null and `len` and `cap` are 0.
             let mut handle = unsafe { ptr.as_vec_mut_with_cap_in(&mut len, &mut cap, &alloc) };
 
             // First push allocates a buffer with `min_non_zero_cap::<i32>() == 4` slots.
@@ -703,6 +774,7 @@ mod tests {
         let mut len: c_int = 0;
         let mut cap: usize = 0;
         {
+            // SAFETY: `ptr` is null and `len` and `cap` are 0.
             let mut handle = unsafe { ptr.as_vec_mut_with_cap(&mut len, &mut cap) };
             handle.push_back(10);
             handle.push_back(20);
@@ -721,16 +793,17 @@ mod tests {
         let slice = (&alloc).allocate(Layout::array::<i32>(4).unwrap()).unwrap();
         let raw = slice.as_ptr() as *mut i32;
         // Initialise the first two elements.
+        // SAFETY: `raw` points to a freshly allocated, aligned buffer for 4 `i32`s.
         unsafe {
             ptr::write(raw, 1);
             ptr::write(raw.add(1), 2);
         }
-        // SAFETY: `raw` was allocated by `alloc` for 4 i32s.
+        // SAFETY: `raw` is properly aligned for `i32` and allocated by `alloc` for 4 `i32`s.
         let mut ptr = unsafe { CBufPtr::from_raw(raw) };
         let mut len: c_int = 2;
         let mut cap: c_int = 4;
         {
-            // SAFETY: ptr holds 4 slots, 2 initialised, allocated via `alloc`.
+            // SAFETY: `ptr` holds 4 slots (2 initialized), allocated via `alloc`.
             let mut handle = unsafe { ptr.as_vec_mut_with_cap_in(&mut len, &mut cap, &alloc) };
             assert_that!(alloc.alloc_count.load(Ordering::SeqCst), eq(1));
 
@@ -753,6 +826,7 @@ mod tests {
     fn c_vec_ref_mut_without_cap_reports_no_capacity() {
         let mut ptr = CBufPtr::<i32>::null();
         let mut len: c_int = 0;
+        // SAFETY: `ptr` is null and `len` is 0.
         let handle = unsafe { ptr.as_vec_mut(&mut len) };
         assert_that!(handle.capacity(), none());
     }
@@ -763,6 +837,8 @@ mod tests {
         let mut ptr = CBufPtr::<i32>::null();
         let mut len: c_int = 3;
         let mut cap: c_int = 2;
+        // SAFETY: `as_vec_mut_with_cap` validates `len <= cap` before performing any unsafe
+        // operations and panics here as tested.
         let _ = unsafe { ptr.as_vec_mut_with_cap(&mut len, &mut cap) };
     }
 
@@ -772,6 +848,8 @@ mod tests {
         let mut ptr = CBufPtr::<i32>::null();
         let mut len: c_int = 0;
         let mut cap: c_int = -1;
+        // SAFETY: `as_vec_mut_with_cap` validates `cap >= 0` before performing any unsafe
+        // operations and panics here as tested.
         let _ = unsafe { ptr.as_vec_mut_with_cap(&mut len, &mut cap) };
     }
 
@@ -781,6 +859,8 @@ mod tests {
         let mut ptr = CBufPtr::<i32>::null();
         let mut len: c_int = 0;
         let mut cap: c_int = 5;
+        // SAFETY: `as_vec_mut_with_cap` validates that a null pointer has `cap == 0` before
+        // performing any unsafe operations and panics here as tested.
         let _ = unsafe { ptr.as_vec_mut_with_cap(&mut len, &mut cap) };
     }
 
@@ -789,6 +869,8 @@ mod tests {
     fn c_vec_ref_mut_null_ptr_non_zero_len_panics() {
         let mut ptr = CBufPtr::<i32>::null();
         let mut len: c_int = 5;
+        // SAFETY: `as_vec_mut` validates that a null pointer has `len == 0` before performing
+        // any unsafe operations and panics here as tested.
         let _ = unsafe { ptr.as_vec_mut(&mut len) };
     }
 
@@ -805,6 +887,7 @@ mod tests {
         let mut ptr = CBufPtr::<Foo>::null();
         let mut len: c_int = 0;
         let mut cap: c_int = 0;
+        // SAFETY: `ptr` is null and `len` and `cap` are 0.
         let mut handle = unsafe { ptr.as_vec_mut_with_cap(&mut len, &mut cap) };
         handle.push_back(Foo(1));
         handle.push_back(Foo(2));
@@ -824,9 +907,11 @@ mod tests {
         let mut len2: c_int = 0;
         let mut cap2: c_int = 0;
         {
+            // SAFETY: `ptr1` is null and `len1` and `cap1` are 0.
             let mut handle1 = unsafe { ptr1.as_vec_mut_with_cap(&mut len1, &mut cap1) };
             handle1.push_back(1);
             handle1.push_back(2);
+            // SAFETY: `ptr2` is null and `len2` and `cap2` are 0.
             let mut handle2 = unsafe { ptr2.as_vec_mut_with_cap(&mut len2, &mut cap2) };
             handle2.push_back(9);
 
@@ -847,6 +932,7 @@ mod tests {
         let mut len: u8 = 0;
         let mut cap: u8 = 0;
         {
+            // SAFETY: `ptr` is null and `len` and `cap` are 0.
             let mut handle = unsafe { ptr.as_vec_mut_with_cap(&mut len, &mut cap) };
             for i in 0..=254 {
                 assert!(handle.try_push_back(i as u8).is_ok());
@@ -871,6 +957,7 @@ mod tests {
         let mut len: i8 = 0;
         let mut cap: i8 = 0;
         {
+            // SAFETY: `ptr` is null and `len` and `cap` are 0.
             let mut handle = unsafe { ptr.as_vec_mut_with_cap(&mut len, &mut cap) };
             for i in 0..=126 {
                 assert!(handle.try_push_back(i as i8).is_ok());
@@ -895,6 +982,7 @@ mod tests {
         let mut len: u16 = 0;
         let mut cap: u8 = 0;
         {
+            // SAFETY: `ptr` is null and `len` and `cap` are 0.
             let mut handle = unsafe { ptr.as_vec_mut_with_cap(&mut len, &mut cap) };
             for i in 0..=254 {
                 assert!(handle.try_push_back((i % 256) as u8).is_ok());
@@ -921,7 +1009,9 @@ mod tests {
         let mut cap1: c_int = 0;
         let mut ptr2 = CBufPtr::<i32>::null();
         let mut len2: c_int = 0;
+        // SAFETY: `ptr1` is null and `len1` and `cap1` are 0.
         let mut handle1 = unsafe { ptr1.as_vec_mut_with_cap(&mut len1, &mut cap1) };
+        // SAFETY: `ptr2` is null and `len2` is 0.
         let mut handle2 = unsafe { ptr2.as_vec_mut(&mut len2) };
         handle1.swap(&mut handle2);
     }

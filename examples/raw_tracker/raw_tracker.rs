@@ -15,17 +15,23 @@ pub struct MyStruct {
 
 static TRACKER: safer_cffi::RawTracker<MyStruct> = safer_cffi::RawTracker::new();
 
+// SAFETY: `new_struct` is the unique symbol for the C API declared in `raw_tracker.h` and its
+// `extern "C"` signature matches the header declaration.
 #[unsafe(no_mangle)]
 pub extern "C" fn new_struct() -> *mut MyStruct {
     let s = Box::new(MyStruct { field: 0 });
     TRACKER.register(s).unwrap_or_default()
 }
 
+// SAFETY: `free_struct` is the unique symbol for the C API declared in `raw_tracker.h` and its
+// `extern "C"` signature matches the header declaration.
 #[unsafe(no_mangle)]
 pub extern "C" fn free_struct(s: *mut MyStruct) {
     let _ = TRACKER.reclaim(s);
 }
 
+// SAFETY: `print_struct` is the unique symbol for the C API declared in `raw_tracker.h` and its
+// `extern "C"` signature matches the header declaration.
 #[unsafe(no_mangle)]
 pub extern "C" fn print_struct(s: *mut MyStruct) {
     // This will fail if `s` has not been created by `new_struct`.

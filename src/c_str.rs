@@ -13,7 +13,8 @@ use core::ptr::NonNull;
 /// A transparent wrapper around `*const c_char` that can be safely used as `Option<CStrRef<'_>>`
 /// in FFI boundaries where a C string is expected.
 ///
-/// Unlike `core::ffi::CStr`, `CStrRef` guarantees a thin pointer layout and ABI compatibility with a C pointer.
+/// Unlike `core::ffi::CStr`, `CStrRef` guarantees a thin pointer layout and ABI compatibility with
+/// a C pointer.
 ///
 /// # Safety Invariants
 /// The pointer must be non-null, properly aligned, and point to a null-terminated string
@@ -21,6 +22,9 @@ use core::ptr::NonNull;
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 pub struct CStrRef<'a> {
+    // Safety invariant: `ptr` points to a valid, nul-terminated C string within a single live
+    // allocation whose byte length (including the trailing nul byte) is at most `isize::MAX`, and
+    // the underlying bytes are valid for reads and not mutated for the entire lifetime `'a`.
     ptr: NonNull<c_char>,
     _marker: PhantomData<&'a CStr>,
 }
@@ -28,8 +32,10 @@ pub struct CStrRef<'a> {
 impl<'a> CStrRef<'a> {
     /// Returns the underlying CStr.
     pub fn to_c_str(self) -> &'a CStr {
-        // SAFETY: The safety invariants of `CStrRef` guarantee that the pointer is valid,
-        // properly aligned, and points to a null-terminated string valid for lifetime 'a.
+        // SAFETY: By the `ptr` field safety invariant of `CStrRef<'a>`, `self.ptr` is non-null,
+        // points to a valid nul-terminated byte sequence within a single allocated object of size
+        // at most `isize::MAX`, and the memory remains valid for reads and unmutated for the full
+        // lifetime `'a`, discharging all preconditions of `CStr::from_ptr`.
         unsafe { CStr::from_ptr(self.ptr.as_ptr()) }
     }
 
@@ -43,6 +49,9 @@ impl<'a> CStrRef<'a> {
 
     /// Creates a new `CStrRef` from a valid `CStr`.
     pub fn from_c_str(c_str: &'a CStr) -> Self {
+        // Safety invariant maintained: `c_str: &'a CStr` is guaranteed by the standard library
+        // to be a non-null pointer to a nul-terminated byte sequence of length `<= isize::MAX`
+        // within a single live allocation that is valid for reads and unmutated for `'a`.
         Self {
             ptr: NonNull::new(c_str.as_ptr() as *mut c_char).expect("CStr pointers are non-null"),
             _marker: PhantomData,
