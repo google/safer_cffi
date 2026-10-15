@@ -39,16 +39,37 @@ Module                                 | Contents                               
 `ffi.rs`                               | `#[unsafe(no_mangle)] pub extern "C" fn` wrappers: unpack arguments, call the core, map results to the C error convention | Ideally none; sometimes necessary for raw `(ptr, len)` parameters
 Core modules (`decoder.rs`, ...)       | The algorithm, written against slices, references and Rust types                                                          | None: `#![forbid(unsafe_code)]` at the top of each file
 
+*   **Size the FFI layer to the library.** For small and medium-sized libraries,
+    one `ffi.rs` plus an optional `c_types.rs` is enough. Larger libraries can
+    split `ffi.rs` into submodules (e.g. `ffi/decode.rs`, `ffi/encode.rs`).
 *   **Naming:** the core follows Rust conventions (`d_gif_open_file`,
     `snake_case` locals). Only the `extern "C"` wrappers, and the `#[repr(C)]`
     structs/fields, keep the exact C names (`DGifOpenFileName`). Put
-    `#![allow(non_snake_case)]` on `ffi.rs` and the C types module, never on the
-    crate root or the core.
-*   **Wrappers stay thin.** No algorithm logic in `ffi.rs`: if a wrapper grows
-    beyond argument unpacking and error mapping, move the logic into the core
-    where `forbid(unsafe_code)` applies.
+    `#![allow(non_snake_case)]` on the FFI modules and
+    `#![allow(nonstandard_style)]` on the C types module (C type names like
+    `z_stream` also trip `non_camel_case_types`), never on the crate root or the
+    core.
+*   **Wrappers stay thin.** No algorithm logic in the FFI layer: if a wrapper
+    grows beyond argument unpacking and error mapping, move the logic into the
+    core where `forbid(unsafe_code)` applies.
+*   **Never hide `unsafe` behind "safe" helper functions.** Do not centralise
+    raw-pointer operations (`ptr.as_mut()`, `Box::from_raw`,
+    `slice::from_raw_parts`, `ptr::copy_nonoverlapping`, `CStr::from_ptr`) into
+    non-`unsafe` helpers (e.g. `ptr_as_mut`, `box_from_raw`, `slice_from_raw`,
+    `read_unaligned_bytes`, `cstr_from_raw`) in `c_types.rs` or a utility module
+    to make `ffi.rs` or the core look `unsafe`-free. These functions have safety
+    preconditions, so marking them safe is unsound. Where a safe signature type
+    (`Option<&mut T>`, `Option<Box<T>>`, `Option<CStrRef<'_>>`) does not already
+    eliminate the raw pointer, either ditch the helper and write the `unsafe`
+    block at the call site (preferred for one-liners) or mark the helper `unsafe
+    fn` with a `# Safety` section.
+*   **Keep `unsafe {}` blocks small and constrained.** Wrap only the single
+    invocation that is `unsafe` (e.g. `let s = unsafe { slice::from_raw_parts(p,
+    len) };`), never a large block or an entire function body.
 *   **Re-export at the crate root** (`pub use c_types::*; pub use ffi::*;`); the
-    signatures test looks up every function and type there.
+    signatures test looks up every function and type there. A split `ffi` must
+    also re-export its submodules (`pub use decode::*;` inside `ffi`), because
+    `pub use ffi::*` does not reach into them.
 
 ## Choosing the Rust type for a C construct
 
@@ -205,7 +226,8 @@ rests on the caller:
     [Aliased arguments](#aliased-arguments).
 
 Struct accessors (below) stay safe: they rely on the struct's documented field
-invariant instead.
+invariant instead. Free helpers taking raw pointers or lengths have no such
+invariant and must be `unsafe fn` (or inlined at the call site).
 
 ## Struct fields: `(T* items, int len)` pairs
 
@@ -471,4 +493,6 @@ Mismatched integer widths (`u32` for `int32_t`, `usize` for `int`)              
 Replacing or freeing a field while a parameter may point to it (`f(g, g->map)`)      | Raw pointer in wrapper; `Arg::Current` if it is that field, else `Arg::New(copy)`     | `take()` drops fields on early errors; a borrowed parameter may alias anything `g` owns, not just the replaced field.
 Returning an out-param in `Ok(..)`, or splitting the core function around it         | Pass it into the core as `&mut T` and write it where C does                           | C may store it before a later step fails; the core keeps C's control flow.
 Safe `extern "C" fn` that trusts one parameter to match another (slot + count)       | `unsafe extern "C" fn` with a `# Safety` section                                      | Safe Rust callers could pass mismatched values.
+"Safe" helpers for raw pointers (`ptr_as_mut`, `slice_from_raw`, `box_from_raw`)     | Ditch the helper (use safe signature types or inline `unsafe`), or mark `unsafe fn`   | They have safety preconditions; omitting `unsafe` hides unsoundness behind a safe API.
+Wrapping a whole function body or surrounding safe code in `unsafe { ... }`          | Put only the single `unsafe` invocation inside `unsafe { ... }`                       | Large `unsafe` blocks obscure which call has preconditions and disable safety checks across safe code.
 Resetting the count or returning early when the array is null but the count is not   | Let `as_vec_mut` panic                                                                | The struct is already corrupt, and C only copes with it by accident.
