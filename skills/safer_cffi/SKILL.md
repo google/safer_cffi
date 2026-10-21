@@ -275,9 +275,48 @@ impl IntArray {
     element count.
 *   **`CBufPtr<T>` when elements need dropping (`T: !Copy`)** (e.g. an array of
     structs that themselves own nested buffers). Because `Drop` must run on each
-    element before freeing the array, `OwnedCBufPtr` cannot be used; add `impl
-    Drop { fn drop(&mut self) { self.items_vec().clear(); } }` and, if needed,
-    `impl Clone` using `CBufPtr::clone_and_leak(self.items())`.
+    element before freeing the array, `OwnedCBufPtr` cannot be used; add an
+    `impl Drop` that clears the buffer:
+
+    ```rust
+    #[repr(C)]
+    pub struct ItemList {
+        // Safety invariant: `items` points to exactly `item_len` initialised
+        // Items allocated with malloc (or is null and item_len == 0).
+        pub items: CBufPtr<Item>,
+        pub item_len: c_int,
+    }
+
+    impl Drop for ItemList {
+        fn drop(&mut self) {
+            self.items_vec().clear(); // drops each Item, then frees the array
+        }
+    }
+
+    impl ItemList {
+        pub fn items_vec(&mut self) -> CVecRefMut<'_, Item, c_int> {
+            // SAFETY: struct invariant; the handle keeps ptr and len in sync.
+            unsafe { self.items.as_vec_mut(&mut self.item_len) }
+        }
+    }
+    ```
+*   **Every `CBufPtr` field needs a `clear()` in `Drop` or a doc comment
+    explaining who owns the array.** Check each one when writing or reviewing a
+    struct (searching for `: CBufPtr<` skips `OwnedCBufPtr`). A `CBufPtr` frees
+    nothing on its own, and the compiler doesn't notice a missing `clear()`; the
+    array (and whatever its elements own) just leaks. Leave the `clear()` out
+    only if the struct does not own the array, e.g. C passes the struct by value
+    to calls that only read it (which also rules out `OwnedCBufPtr`). Then say
+    on the field who owns and frees it (`/// Owned by the C caller, which passes
+    ItemList by value; freed by free_list().`), so reviewers can check that
+    owner instead of guessing whether the missing `clear()` is a leak.
+*   **Put that `Drop` impl immediately after the struct definition**, ahead of
+    the accessors and any other `impl` block, so that checking every field
+    against a `clear()` takes a glance instead of a search through the file.
+*   **No `unsafe` in `Drop`.** Don't build the `CVecRefMut` inline (`unsafe {
+    self.items.as_vec_mut(&mut self.item_len) }.clear()`); add `items_vec()` to
+    the regular `impl` block and call `self.items_vec().clear()`. `Drop` then
+    needs no `// SAFETY:` argument of its own.
 *   **Mutate through `CVecRefMut`, never by hand.** `push_back`,
     `try_push_back`, `clear`, `swap` keep `ptr`, `len` (and `cap`) consistent
     and use `malloc`/`realloc`/`free` so C can keep freeing with `free()`.
@@ -487,6 +526,9 @@ Bumping `len` yourself after writing past the end                               
 C-style names (`DGifGetLine`) or `#![allow(non_snake_case)]` in core modules         | Rust names in the core; C names only on `extern "C"` wrappers and `#[repr(C)]` types  | Keeps the lint useful where the logic lives.
 `push_back` in an entry point that returns an error code on OOM                      | `try_push_back(v)` and map `Err` to the error code                                    | `push_back` panics on allocation failure.
 `impl Drop` that calls `clear()` on an `OwnedCBufPtr` field                          | Nothing; `OwnedCBufPtr` frees itself                                                  | Redundant `unsafe` and a second invariant to keep in sync.
+`CBufPtr` field with neither a `clear()` in `Drop` nor a doc comment on its owner    | `clear()` it in `Drop`, or document on the field who owns and frees the array         | Without either, reviewers can't tell whether the missing `clear()` is a leak.
+`impl Drop` of a `CBufPtr` struct placed after its accessors or other `impl` blocks  | `impl Drop` immediately after the struct definition                                   | Reviewers match each `CBufPtr` field to a `clear()` call; a missed one compiles fine and leaks.
+`unsafe { self.items.as_vec_mut(&mut self.item_len) }.clear()` in `Drop`             | `self.items_vec().clear()`, with `items_vec()` in the regular `impl` block            | `Drop` needs no `// SAFETY:` argument of its own and can't drift from the accessor.
 `OwnedCBufPtr::from_boxed_slice(std_vec.into_boxed_slice())`                         | Build a `CVec` (`Vec<T, LibcAlloc>`)                                                  | C frees the buffer with `free()`; it must come from `malloc`.
 `RawTracker` "because the API already passes pointers"                               | `OpaqueTracker` unless C dereferences the pointer                                     | Raw keys are slower and vulnerable to ABA reuse.
 Mismatched integer widths (`u32` for `int32_t`, `usize` for `int`)                   | Match the header exactly (`i32`, `c_int`)                                             | Links fine, corrupts data on the C side.
