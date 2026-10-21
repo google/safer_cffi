@@ -70,6 +70,19 @@ fn dangling_slice(layout: Layout) -> NonNull<[u8]> {
     NonNull::slice_from_raw_parts(layout.dangling_ptr(), 0)
 }
 
+/// Number of bytes to request from `malloc` for `layout`, or `None` if `malloc` cannot satisfy
+/// its alignment.
+///
+/// C23 (7.24.3, via N2293) only promises that `malloc(n)` is aligned for types of size at most
+/// `n`, so `malloc(1)` may return a 1-aligned pointer. WG14 treats this as a clarification of
+/// earlier wording, and Miri's `malloc` implements it. Requesting at least `layout.align()`
+/// bytes brings the guarantee up to the alignment asked for, the same way `std::alloc::System`
+/// only uses plain `malloc` when `align <= size`.
+#[inline]
+fn malloc_size(layout: Layout) -> Option<usize> {
+    (layout.align() <= MALLOC_ALIGN).then(|| layout.size().max(layout.align()))
+}
+
 /// Zero-sized allocator backed by standard C library `malloc`, `calloc`, `realloc`, and `free`.
 ///
 /// managed by C standard library functions across the FFI boundary.
@@ -85,12 +98,10 @@ unsafe impl Allocator for LibcAlloc {
         if layout.size() == 0 {
             return Ok(dangling_slice(layout));
         }
+        let size = malloc_size(layout).ok_or(AllocError)?;
 
-        if layout.align() > MALLOC_ALIGN {
-            return Err(AllocError);
-        }
         // SAFETY: `malloc` has no preconditions.
-        let ptr = unsafe { libc::malloc(layout.size()) as *mut u8 };
+        let ptr = unsafe { libc::malloc(size) as *mut u8 };
         NonNull::new(ptr).map(|p| NonNull::slice_from_raw_parts(p, layout.size())).ok_or(AllocError)
     }
 
@@ -99,13 +110,10 @@ unsafe impl Allocator for LibcAlloc {
         if layout.size() == 0 {
             return Ok(dangling_slice(layout));
         }
-
-        if layout.align() > MALLOC_ALIGN {
-            return Err(AllocError);
-        }
+        let size = malloc_size(layout).ok_or(AllocError)?;
 
         // SAFETY: `calloc` has no preconditions.
-        let ptr = unsafe { libc::calloc(layout.size(), 1) as *mut u8 };
+        let ptr = unsafe { libc::calloc(size, 1) as *mut u8 };
 
         let non_null = NonNull::new(ptr).ok_or(AllocError)?;
         Ok(NonNull::slice_from_raw_parts(non_null, layout.size()))
@@ -134,15 +142,12 @@ unsafe impl Allocator for LibcAlloc {
         if old_layout.size() == 0 {
             return self.allocate(new_layout);
         }
-        if new_layout.align() > MALLOC_ALIGN {
-            return Err(AllocError);
-        }
+        let size = malloc_size(new_layout).ok_or(AllocError)?;
 
         // SAFETY: The caller ensures that `ptr` was allocated by this allocator
         // and has not been deallocated yet.
-        let new_ptr = unsafe {
-            libc::realloc(ptr.cast::<core::ffi::c_void>().as_ptr(), new_layout.size()) as *mut u8
-        };
+        let new_ptr =
+            unsafe { libc::realloc(ptr.cast::<core::ffi::c_void>().as_ptr(), size) as *mut u8 };
         NonNull::new(new_ptr)
             .map(|p| NonNull::slice_from_raw_parts(p, new_layout.size()))
             .ok_or(AllocError)
@@ -200,13 +205,11 @@ mod tests {
     use googletest::prelude::*;
 
     /// Checks that `allocate`, `allocate_zeroed` and `grow` serve every alignment `malloc`
-    /// guarantees, return pointers aligned to the layout, and refuse anything stricter.
+    /// guarantees, return pointers aligned to the layout, and refuse anything stricter. Layouts
+    /// smaller than their alignment are included: plain `malloc(size)` would not guarantee those.
     ///
-    /// Sizes start at the alignment: `malloc(n)` is only guaranteed to be aligned for types that
-    /// fit in `n` bytes (C23 7.24.3), and Miri's `malloc` gives no more than that.
-    ///
-    /// Under Miri this is exact. On a real libc a pass is evidence, not proof: allocators tend
-    /// to over-align small blocks.
+    /// Under Miri this is exact, since its `malloc` aligns only as much as C requires. On a real
+    /// libc a pass is evidence, not proof: allocators tend to over-align small blocks.
     #[gtest]
     fn libc_alloc_results_are_aligned() {
         let alloc = LibcAlloc;
@@ -216,7 +219,7 @@ mod tests {
 
         let mut align = 1;
         while align <= MALLOC_ALIGN {
-            for size in align..=4 * MALLOC_ALIGN {
+            for size in 1..=4 * MALLOC_ALIGN {
                 let layout = Layout::from_size_align(size, align).unwrap();
                 let larger = Layout::from_size_align(size + 1, align).unwrap();
 
