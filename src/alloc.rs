@@ -179,6 +179,81 @@ mod tests {
     use super::*;
     use googletest::prelude::*;
 
+    /// The alignment `malloc` guarantees on this target: that of C's `max_align_t`, where `libc`
+    /// defines it; otherwise take `MALLOC_ALIGN` at its word.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        all(target_os = "android", not(target_arch = "arm")),
+        all(target_os = "windows", target_env = "gnu"),
+    ))]
+    const GUARANTEED_MALLOC_ALIGN: usize = core::mem::align_of::<libc::max_align_t>();
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        all(target_os = "android", not(target_arch = "arm")),
+        all(target_os = "windows", target_env = "gnu"),
+    )))]
+    const GUARANTEED_MALLOC_ALIGN: usize = MALLOC_ALIGN;
+
+    /// Checks that `allocate`, `allocate_zeroed` and `grow` serve every alignment `malloc`
+    /// guarantees, return pointers aligned to the layout, and refuse anything stricter.
+    ///
+    /// Sizes start at the alignment: `malloc(n)` is only guaranteed to be aligned for types that
+    /// fit in `n` bytes (C23 7.24.3), and Miri's `malloc` gives no more than that.
+    ///
+    /// Under Miri this is exact. On a real libc a pass is evidence, not proof: allocators tend
+    /// to over-align small blocks.
+    #[gtest]
+    fn libc_alloc_results_are_aligned() {
+        let alloc = LibcAlloc;
+        let is_aligned = |slice: NonNull<[u8]>, align: usize| {
+            (slice.as_ptr() as *mut u8).addr().is_multiple_of(align)
+        };
+
+        let mut align = 1;
+        while align <= GUARANTEED_MALLOC_ALIGN {
+            for size in align..=4 * GUARANTEED_MALLOC_ALIGN {
+                let layout = Layout::from_size_align(size, align).unwrap();
+                let larger = Layout::from_size_align(size + 1, align).unwrap();
+
+                let slice = alloc.allocate(layout).unwrap();
+                assert_that!(is_aligned(slice, align), eq(true), "allocate({size}, {align})");
+                let ptr = NonNull::new(slice.as_ptr() as *mut u8).unwrap();
+                // SAFETY: `ptr` was allocated with `layout`, and `larger` is not smaller.
+                let slice = unsafe { alloc.grow(ptr, layout, larger) }.unwrap();
+                assert_that!(is_aligned(slice, align), eq(true), "grow({size}, {align})");
+                let ptr = NonNull::new(slice.as_ptr() as *mut u8).unwrap();
+                // SAFETY: `ptr` was returned by `grow` with `larger`.
+                unsafe { alloc.deallocate(ptr, larger) };
+
+                let slice = alloc.allocate_zeroed(layout).unwrap();
+                assert_that!(
+                    is_aligned(slice, align),
+                    eq(true),
+                    "allocate_zeroed({size}, {align})"
+                );
+                let ptr = NonNull::new(slice.as_ptr() as *mut u8).unwrap();
+                // SAFETY: `ptr` was allocated with `layout`.
+                unsafe { alloc.deallocate(ptr, layout) };
+            }
+            align *= 2;
+        }
+
+        let too_strict = Layout::from_size_align(1, 2 * GUARANTEED_MALLOC_ALIGN).unwrap();
+        assert_that!(alloc.allocate(too_strict), err(anything()));
+        assert_that!(alloc.allocate_zeroed(too_strict), err(anything()));
+
+        let small = Layout::from_size_align(1, 1).unwrap();
+        let ptr = NonNull::new(alloc.allocate(small).unwrap().as_ptr() as *mut u8).unwrap();
+        // SAFETY: `ptr` was allocated with `small`, and `too_strict` is not smaller.
+        assert_that!(unsafe { alloc.grow(ptr, small, too_strict) }, err(anything()));
+        // SAFETY: a failed `grow` leaves `ptr` allocated with `small`.
+        unsafe { alloc.deallocate(ptr, small) };
+    }
+
     #[gtest]
     fn libc_alloc_zero_size() {
         let alloc = LibcAlloc;
