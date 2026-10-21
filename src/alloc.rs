@@ -19,26 +19,46 @@ pub type CBox<T> = Box<T, LibcAlloc>;
 /// A `Vec` that uses the C allocator (`LibcAlloc`).
 pub type CVec<T> = Vec<T, LibcAlloc>;
 
-/// The maximum alignment guaranteed by standard `malloc`.
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", target_os = "ios"))]
+/// The maximum alignment guaranteed by standard `malloc`: that of C's `max_align_t`, taken from
+/// `libc` on the targets where it defines it.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "ios",
+    all(target_os = "android", not(target_arch = "arm")),
+    all(target_os = "windows", target_env = "gnu"),
+))]
 const MALLOC_ALIGN: usize = core::mem::align_of::<libc::max_align_t>();
 
+/// The maximum alignment guaranteed by standard `malloc`.
+///
+/// `libc` does not define `max_align_t` for this target, so approximate it with a `repr(C)`
+/// union of the fundamental types. Erring high would be unsound: a layout `malloc` cannot
+/// satisfy would get through. Erring low only refuses layouts it could have served. The
+/// `libc_alloc_results_are_aligned` test checks the result at runtime.
 #[cfg(not(any(
     target_os = "linux",
     target_os = "macos",
-    target_os = "windows",
-    target_os = "ios"
+    target_os = "ios",
+    all(target_os = "android", not(target_arch = "arm")),
+    all(target_os = "windows", target_env = "gnu"),
 )))]
 const MALLOC_ALIGN: usize = {
-    // Fallback for weird platforms: Do an approximation at compile time,
-    // but also check the alignment at runtime below to avoid UB.
     #[repr(C)]
-    union MallocAlignProxy {
-        _a: f64,
-        _b: u64,
-        _c: *const (),
+    union MaxAlign {
+        _f64: f64,
+        // `u128` pulls this up to 16 bytes where the C ABI gives `long double` or `__int128`
+        // that alignment. Rust aligns it to 16 on 32-bit x86 too, where `malloc` guarantees
+        // 8, and on aarch64 Apple targets `long double` is `double`, so leave it out on both.
+        #[cfg(all(
+            target_pointer_width = "64",
+            not(all(target_vendor = "apple", target_arch = "aarch64"))
+        ))]
+        _u128: u128,
+        _u64: u64,
+        _ptr: *const (),
     }
-    core::mem::align_of::<MallocAlignProxy>()
+    core::mem::align_of::<MaxAlign>()
 };
 
 /// Returns a non-null, dangling slice pointer aligned to `layout.align()` with length 0.
@@ -179,25 +199,6 @@ mod tests {
     use super::*;
     use googletest::prelude::*;
 
-    /// The alignment `malloc` guarantees on this target: that of C's `max_align_t`, where `libc`
-    /// defines it; otherwise take `MALLOC_ALIGN` at its word.
-    #[cfg(any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "ios",
-        all(target_os = "android", not(target_arch = "arm")),
-        all(target_os = "windows", target_env = "gnu"),
-    ))]
-    const GUARANTEED_MALLOC_ALIGN: usize = core::mem::align_of::<libc::max_align_t>();
-    #[cfg(not(any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "ios",
-        all(target_os = "android", not(target_arch = "arm")),
-        all(target_os = "windows", target_env = "gnu"),
-    )))]
-    const GUARANTEED_MALLOC_ALIGN: usize = MALLOC_ALIGN;
-
     /// Checks that `allocate`, `allocate_zeroed` and `grow` serve every alignment `malloc`
     /// guarantees, return pointers aligned to the layout, and refuse anything stricter.
     ///
@@ -214,8 +215,8 @@ mod tests {
         };
 
         let mut align = 1;
-        while align <= GUARANTEED_MALLOC_ALIGN {
-            for size in align..=4 * GUARANTEED_MALLOC_ALIGN {
+        while align <= MALLOC_ALIGN {
+            for size in align..=4 * MALLOC_ALIGN {
                 let layout = Layout::from_size_align(size, align).unwrap();
                 let larger = Layout::from_size_align(size + 1, align).unwrap();
 
@@ -242,7 +243,7 @@ mod tests {
             align *= 2;
         }
 
-        let too_strict = Layout::from_size_align(1, 2 * GUARANTEED_MALLOC_ALIGN).unwrap();
+        let too_strict = Layout::from_size_align(1, 2 * MALLOC_ALIGN).unwrap();
         assert_that!(alloc.allocate(too_strict), err(anything()));
         assert_that!(alloc.allocate_zeroed(too_strict), err(anything()));
 
