@@ -70,27 +70,63 @@ fn dangling_slice(layout: Layout) -> NonNull<[u8]> {
     NonNull::slice_from_raw_parts(layout.dangling_ptr(), 0)
 }
 
-/// Zero-sized allocator backed by standard C library `malloc`, `calloc`, `realloc`, and `free`.
+/// Number of bytes to request from `malloc` for `layout`, or `None` if `malloc` cannot satisfy
+/// its alignment.
 ///
-/// managed by C standard library functions across the FFI boundary.
+/// C23 (7.24.3, via N2293) only promises that `malloc(n)` is aligned for types of size at most
+/// `n`, so `malloc(1)` may return a 1-aligned pointer. WG14 treats this as a clarification of
+/// earlier wording, and Miri's `malloc` implements it. Requesting at least `layout.align()`
+/// bytes brings the guarantee up to the alignment asked for. `std::alloc::System` avoids the
+/// same hole by using plain `malloc` only when `align <= size`.
+///
+/// # Safety-usable invariant
+///
+/// If this returns `Some(n)`, then `n >= layout.size()` and a non-null result of `malloc(n)`,
+/// `calloc(n, 1)`, or `realloc(_, n)` is aligned to `layout.align()`. The second part follows
+/// from C23 7.24.3 given that `layout.align() <= MALLOC_ALIGN` and that on every supported
+/// target each power of two up to `alignof(max_align_t)` is the alignment of some
+/// fundamental type no larger than itself (`char`, `short`, `int`, `long long` or a pointer,
+/// `long double` or `__int128`). `libc_alloc_results_are_aligned` checks this at runtime.
+#[inline]
+fn malloc_size(layout: Layout) -> Option<usize> {
+    (layout.align() <= MALLOC_ALIGN).then(|| layout.size().max(layout.align()))
+}
+
+/// Zero-sized allocator backed by standard C library `malloc`, `calloc`, `realloc`, and `free`,
+/// for memory whose ownership crosses the FFI boundary.
+///
+/// Beyond the [`Allocator`] contract, unsafe code may rely on the following:
+///
+/// - Every non-zero-sized block comes straight from `malloc`, `calloc`, or `realloc`, with no
+///   header or offset. C code may `free` or `realloc` it. Conversely, `deallocate`, `grow`, and
+///   `shrink` use only `ptr` and the layout sizes, never `old_layout.align()`, so a block from C's
+///   `malloc` may be passed to them with any layout whose size is within the block.
+/// - A block is aligned to its layout even when the layout is smaller than its alignment, which
+///   plain `malloc(size)` does not guarantee (see `malloc_size`).
+/// - A layout with alignment above `MALLOC_ALIGN` is refused with `AllocError`, never served
+///   misaligned.
+/// - Zero-sized layouts never reach `malloc`; the dangling pointer they get must not be passed to
+///   `free`. `deallocate` handles this itself; code that frees through C must check the size.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LibcAlloc;
 
 // SAFETY: `LibcAlloc` delegates to standard C allocation functions whose memory is safe
 // to free with `libc::free`. Copying, cloning, or moving this allocator is not invalidating memory
-// blocks returned from it, since the state lives in the allocator.
+// blocks returned from it, since the state lives in the allocator. Returned blocks meet the
+// requested layout: `malloc_size` (see its safety-usable invariant) picks a request size that is
+// at least `layout.size()` and makes the C result aligned to `layout.align()`.
 unsafe impl Allocator for LibcAlloc {
     #[inline]
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         if layout.size() == 0 {
             return Ok(dangling_slice(layout));
         }
+        let size = malloc_size(layout).ok_or(AllocError)?;
 
-        if layout.align() > MALLOC_ALIGN {
-            return Err(AllocError);
-        }
-        // SAFETY: `malloc` has no preconditions.
-        let ptr = unsafe { libc::malloc(layout.size()) as *mut u8 };
+        // SAFETY: `malloc` has no preconditions. If the result is non-null it is a fresh block,
+        // valid for reads and writes of `size` bytes, and by `malloc_size`'s safety-usable
+        // invariant `size >= layout.size()` and the block is aligned to `layout.align()`.
+        let ptr = unsafe { libc::malloc(size) as *mut u8 };
         NonNull::new(ptr).map(|p| NonNull::slice_from_raw_parts(p, layout.size())).ok_or(AllocError)
     }
 
@@ -99,13 +135,12 @@ unsafe impl Allocator for LibcAlloc {
         if layout.size() == 0 {
             return Ok(dangling_slice(layout));
         }
+        let size = malloc_size(layout).ok_or(AllocError)?;
 
-        if layout.align() > MALLOC_ALIGN {
-            return Err(AllocError);
-        }
-
-        // SAFETY: `calloc` has no preconditions.
-        let ptr = unsafe { libc::calloc(layout.size(), 1) as *mut u8 };
+        // SAFETY: `calloc` has no preconditions. If the result is non-null it is a fresh block of
+        // `size` zeroed bytes, and by `malloc_size`'s safety-usable invariant `size >=
+        // layout.size()` and the block is aligned to `layout.align()`.
+        let ptr = unsafe { libc::calloc(size, 1) as *mut u8 };
 
         let non_null = NonNull::new(ptr).ok_or(AllocError)?;
         Ok(NonNull::slice_from_raw_parts(non_null, layout.size()))
@@ -134,15 +169,15 @@ unsafe impl Allocator for LibcAlloc {
         if old_layout.size() == 0 {
             return self.allocate(new_layout);
         }
-        if new_layout.align() > MALLOC_ALIGN {
-            return Err(AllocError);
-        }
+        let size = malloc_size(new_layout).ok_or(AllocError)?;
 
-        // SAFETY: The caller ensures that `ptr` was allocated by this allocator
-        // and has not been deallocated yet.
-        let new_ptr = unsafe {
-            libc::realloc(ptr.cast::<core::ffi::c_void>().as_ptr(), new_layout.size()) as *mut u8
-        };
+        // SAFETY: The caller ensures that `ptr` was allocated by this allocator and has not been
+        // deallocated yet. If the result is non-null it is valid for reads and writes of `size`
+        // bytes with the first `min(old_layout.size(), size)` bytes preserved, and by
+        // `malloc_size`'s safety-usable invariant `size >= new_layout.size()` and the block is
+        // aligned to `new_layout.align()`. If it is null, `ptr` is still allocated and unchanged.
+        let new_ptr =
+            unsafe { libc::realloc(ptr.cast::<core::ffi::c_void>().as_ptr(), size) as *mut u8 };
         NonNull::new(new_ptr)
             .map(|p| NonNull::slice_from_raw_parts(p, new_layout.size()))
             .ok_or(AllocError)
@@ -199,14 +234,13 @@ mod tests {
     use super::*;
     use googletest::prelude::*;
 
-    /// Checks that `allocate`, `allocate_zeroed` and `grow` serve every alignment `malloc`
-    /// guarantees, return pointers aligned to the layout, and refuse anything stricter.
+    /// Checks that `allocate`, `allocate_zeroed`, `grow` and `shrink` serve every alignment
+    /// `malloc` guarantees, return pointers aligned to the layout, and refuse anything stricter.
+    /// Layouts smaller than their alignment are included: plain `malloc(size)` would not
+    /// guarantee those.
     ///
-    /// Sizes start at the alignment: `malloc(n)` is only guaranteed to be aligned for types that
-    /// fit in `n` bytes (C23 7.24.3), and Miri's `malloc` gives no more than that.
-    ///
-    /// Under Miri this is exact. On a real libc a pass is evidence, not proof: allocators tend
-    /// to over-align small blocks.
+    /// Under Miri this is exact, since its `malloc` aligns only as much as C requires. On a real
+    /// libc a pass is evidence, not proof: allocators tend to over-align small blocks.
     #[gtest]
     fn libc_alloc_results_are_aligned() {
         let alloc = LibcAlloc;
@@ -216,7 +250,7 @@ mod tests {
 
         let mut align = 1;
         while align <= MALLOC_ALIGN {
-            for size in align..=4 * MALLOC_ALIGN {
+            for size in 1..=4 * MALLOC_ALIGN {
                 let layout = Layout::from_size_align(size, align).unwrap();
                 let larger = Layout::from_size_align(size + 1, align).unwrap();
 
@@ -240,6 +274,18 @@ mod tests {
                 // SAFETY: `ptr` was allocated with `layout`.
                 unsafe { alloc.deallocate(ptr, layout) };
             }
+
+            // Shrinking to below the alignment is the `realloc` form of the same case.
+            let big = Layout::from_size_align(4 * MALLOC_ALIGN, align).unwrap();
+            let one = Layout::from_size_align(1, align).unwrap();
+            let ptr = NonNull::new(alloc.allocate(big).unwrap().as_ptr() as *mut u8).unwrap();
+            // SAFETY: `ptr` was allocated with `big`, and `one` is not larger.
+            let slice = unsafe { alloc.shrink(ptr, big, one) }.unwrap();
+            assert_that!(is_aligned(slice, align), eq(true), "shrink(1, {align})");
+            let ptr = NonNull::new(slice.as_ptr() as *mut u8).unwrap();
+            // SAFETY: `ptr` was returned by `shrink` with `one`.
+            unsafe { alloc.deallocate(ptr, one) };
+
             align *= 2;
         }
 
