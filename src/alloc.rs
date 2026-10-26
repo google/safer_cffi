@@ -110,11 +110,19 @@ fn malloc_size(layout: Layout) -> Option<usize> {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LibcAlloc;
 
-// SAFETY: `LibcAlloc` delegates to standard C allocation functions whose memory is safe
-// to free with `libc::free`. Copying, cloning, or moving this allocator is not invalidating memory
-// blocks returned from it, since the state lives in the allocator. Returned blocks meet the
-// requested layout: `malloc_size` (see its safety-usable invariant) picks a request size that is
-// at least `layout.size()` and makes the C result aligned to `layout.align()`.
+// SAFETY: The `Allocator` contract asks for three things.
+//
+// - Blocks stay valid until the allocator and its clones are dropped: non-zero-sized blocks live in
+//   the C heap and are released only by an explicit `free`/`realloc`; zero-sized blocks are
+//   dangling pointers that are never dereferenced. `LibcAlloc` holds no state and has no `Drop`.
+// - Clones and moves behave like the same allocator: `LibcAlloc` is a zero-sized `Copy` type, so
+//   every value is interchangeable with every other.
+// - Any currently allocated block may be passed to any method: `deallocate`, `grow`, and `shrink`
+//   use only `ptr` and the layout sizes, which every block satisfies.
+//
+// Returned blocks meet the requested layout: `malloc_size` (see its safety-usable invariant)
+// picks a request size that is at least `layout.size()` and makes the C result aligned to
+// `layout.align()`.
 unsafe impl Allocator for LibcAlloc {
     #[inline]
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
@@ -149,7 +157,11 @@ unsafe impl Allocator for LibcAlloc {
     #[inline]
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
         if layout.size() != 0 {
-            // SAFETY: The caller guarantees `ptr` was allocated by this allocator with `layout`.
+            // SAFETY: `free` requires a pointer from `malloc`/`calloc`/`realloc` that has not been
+            // freed. By the `deallocate` contract `ptr` is currently allocated by this allocator
+            // and `layout` fits it, so `layout.size() != 0` means the block is non-zero-sized,
+            // and every such block is a live C block (see the `LibcAlloc` docs). Afterwards `ptr`
+            // is invalid, as `deallocate` promises.
             unsafe { libc::free(ptr.as_ptr().cast::<core::ffi::c_void>()) };
         }
     }
@@ -161,26 +173,10 @@ unsafe impl Allocator for LibcAlloc {
         old_layout: Layout,
         new_layout: Layout,
     ) -> Result<NonNull<[u8]>, AllocError> {
-        if new_layout.size() == 0 {
-            // SAFETY: The caller ensures `ptr` was allocated with `old_layout`.
-            unsafe { self.deallocate(ptr, old_layout) };
-            return Ok(dangling_slice(new_layout));
-        }
-        if old_layout.size() == 0 {
-            return self.allocate(new_layout);
-        }
-        let size = malloc_size(new_layout).ok_or(AllocError)?;
-
-        // SAFETY: The caller ensures that `ptr` was allocated by this allocator and has not been
-        // deallocated yet. If the result is non-null it is valid for reads and writes of `size`
-        // bytes with the first `min(old_layout.size(), size)` bytes preserved, and by
-        // `malloc_size`'s safety-usable invariant `size >= new_layout.size()` and the block is
-        // aligned to `new_layout.align()`. If it is null, `ptr` is still allocated and unchanged.
-        let new_ptr =
-            unsafe { libc::realloc(ptr.cast::<core::ffi::c_void>().as_ptr(), size) as *mut u8 };
-        NonNull::new(new_ptr)
-            .map(|p| NonNull::slice_from_raw_parts(p, new_layout.size()))
-            .ok_or(AllocError)
+        // SAFETY: `resize` requires `ptr` to be currently allocated by this allocator with
+        // `old_layout` fitting it, which is the `grow` contract. The size ordering `grow` also
+        // requires is not needed by `resize`.
+        unsafe { self.resize(ptr, old_layout, new_layout) }
     }
 
     #[inline]
@@ -190,9 +186,56 @@ unsafe impl Allocator for LibcAlloc {
         old_layout: Layout,
         new_layout: Layout,
     ) -> Result<NonNull<[u8]>, AllocError> {
-        // SAFETY: The caller must ensure that `ptr` was allocated by this allocator
-        // and has not been deallocated yet.
-        unsafe { self.grow(ptr, old_layout, new_layout) }
+        // SAFETY: `resize` requires `ptr` to be currently allocated by this allocator with
+        // `old_layout` fitting it, which is the `shrink` contract. The size ordering `shrink` also
+        // requires is not needed by `resize`.
+        unsafe { self.resize(ptr, old_layout, new_layout) }
+    }
+}
+
+impl LibcAlloc {
+    /// Moves the block at `ptr` from `old_layout` to `new_layout`, in either direction. Shared
+    /// body of [`Allocator::grow`] and [`Allocator::shrink`].
+    ///
+    /// On `Ok`, the first `min(old_layout.size(), new_layout.size())` bytes are preserved and
+    /// `ptr` is no longer valid. On `Err`, `ptr` is still allocated and unchanged.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `ptr` denotes a block currently allocated via this allocator
+    /// and that `old_layout` fits it, in the sense of the [`Allocator`] docs. `new_layout` may be
+    /// larger or smaller than `old_layout` and may have a different alignment.
+    #[inline]
+    unsafe fn resize(
+        &self,
+        ptr: NonNull<u8>,
+        old_layout: Layout,
+        new_layout: Layout,
+    ) -> Result<NonNull<[u8]>, AllocError> {
+        if new_layout.size() == 0 {
+            // SAFETY: `ptr` is currently allocated with a fitting `old_layout`, as this function's
+            // contract requires and `deallocate` needs.
+            unsafe { self.deallocate(ptr, old_layout) };
+            return Ok(dangling_slice(new_layout));
+        }
+        if old_layout.size() == 0 {
+            // `ptr` is a dangling pointer that owns nothing, so there is nothing to move or free.
+            return self.allocate(new_layout);
+        }
+        let size = malloc_size(new_layout).ok_or(AllocError)?;
+
+        // SAFETY: `realloc` requires a pointer from `malloc`/`calloc`/`realloc` that has not been
+        // freed. By this function's contract `ptr` is currently allocated with a fitting
+        // `old_layout`, and `old_layout.size() != 0` here, so it is a live C block (see the
+        // `LibcAlloc` docs). If the result is non-null it is valid for reads and writes of `size`
+        // bytes with the first `min(old_layout.size(), size)` bytes preserved, and by
+        // `malloc_size`'s safety-usable invariant `size >= new_layout.size()` and the block is
+        // aligned to `new_layout.align()`. If it is null, `ptr` is still allocated and unchanged.
+        let new_ptr =
+            unsafe { libc::realloc(ptr.cast::<core::ffi::c_void>().as_ptr(), size) as *mut u8 };
+        NonNull::new(new_ptr)
+            .map(|p| NonNull::slice_from_raw_parts(p, new_layout.size()))
+            .ok_or(AllocError)
     }
 }
 
@@ -222,8 +265,10 @@ pub trait DropByPtrAllocator: Allocator {
 impl DropByPtrAllocator for LibcAlloc {
     #[inline]
     unsafe fn deallocate_by_ptr(ptr: NonNull<u8>) {
-        // SAFETY: The caller guarantees `ptr` was allocated by this allocator with a non-zero
-        // layout and is exclusively owned.
+        // SAFETY: `free` requires a pointer from `malloc`/`calloc`/`realloc` that has not been
+        // freed. By the `deallocate_by_ptr` contract `ptr` is currently allocated by this
+        // allocator with a non-zero size, and every such block is a live C block (see the
+        // `LibcAlloc` docs). The contract also forbids any later access through `ptr`.
         unsafe { libc::free(ptr.as_ptr().cast::<core::ffi::c_void>()) };
     }
 }
