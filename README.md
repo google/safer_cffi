@@ -71,24 +71,27 @@ access and manipulation.
 *   **`CBufPtr<T, A = LibcAlloc>`**: Unowned buffer pointer wrapper
     (`#[repr(transparent)]` around `*mut T`). Does not deallocate on drop.
 
-    *   `with_len(len)` → `&[T]` — shared slice view for any `len: L` where `L:
-        CBufLen`.
+    *   `with_len(len)` → `&[T]` — shared slice view for any `len: L` where
+        `L: CBufLen`.
     *   `with_len_mut(len)` → `&mut [T]` — mutable slice view for any `len: L`
-        where `L: CBufLen` and `A = LibcAlloc`.
-    *   `as_vec_mut(&mut len)` → `CVecRefMut<'_, T, L, A>` — mutable vector
-        handle for any `L: CBufLen` (when `A: Default`).
+        where `L: CBufLen`.
+    *   `as_vec_mut(&mut len)` → `CVecRefMut<'_, T, L>` — mutable vector handle
+        for any `L: CBufLen` where `A = LibcAlloc`.
     *   `as_vec_mut_in(&mut len, alloc)` → `CVecRefMut<'_, T, L, A>` — mutable
         vector handle with custom allocator instance.
-    *   `as_vec_mut_with_cap(&mut len, &mut cap)` → `CVecRefMut<'_, T, L, A, C>`
-        — capacity-tracking mutable vector handle. The extra `cap: C` field lets
-        `push_back` reuse spare capacity and grow geometrically, saving
-        reallocations.
-    *   `as_vec_mut_with_cap_in(&mut len, &mut cap, alloc)` → `CVecRefMut<'_, T,
-        L, A, C>` — capacity-tracking handle with a custom allocator instance.
+    *   `as_vec_mut_with_cap(&mut len, &mut cap)` →
+        `CVecRefMut<'_, T, L, LibcAlloc, C>` — capacity-tracking mutable vector
+        handle where `A = LibcAlloc`. The extra `cap: C` field lets `push_back`
+        reuse spare capacity and grow geometrically, saving reallocations.
+    *   `as_vec_mut_with_cap_in(&mut len, &mut cap, alloc)` →
+        `CVecRefMut<'_, T, L, A, C>` — capacity-tracking handle with a custom
+        allocator instance.
     *   `clone_and_leak(&[T])` → `CBufPtr<T>` — create a new CBufPtr by cloning
         an existing slice using `LibcAlloc`.
     *   `clone_and_leak_in(&[T], alloc)` → `CBufPtr<T, A>` — create a new
         CBufPtr by cloning an existing slice using a custom allocator.
+    *   `try_clone_and_leak[_in]` — fallible variants of the above that return
+        `Err(AllocError)` instead of panicking if allocation fails.
     *   `from_boxed_slice(Box<[T], A>)` → `CBufPtr<T, A>` — create a new CBufPtr
         from a `Box<[T]>`, transferring ownership.
 
@@ -158,6 +161,28 @@ impl MyStruct {
 ```
 
 See [`examples/c_buf_ptr/`](examples/c_buf_ptr/) for a full example.
+
+#### Custom C allocators — `CLikeAlloc`
+
+Many C libraries let callers install their own memory allocation functions.
+`CLikeAlloc` wraps a `malloc`- or `calloc`-like function and a `free`-like
+function in an `Allocator` that can be passed to the `*_in` methods above, or
+used as `CBox<T, CLikeAlloc>` and `CVec<T, CLikeAlloc>`:
+
+```rust
+// SAFETY: `hooks.calloc` and `hooks.free` behave like C's `calloc` and `free`.
+let alloc = unsafe { CLikeAlloc::new_with_calloc(hooks.calloc, hooks.free) };
+// SAFETY: the length of `items` (a `CBufPtr<Item, CLikeAlloc>`) is `item_len`,
+// and `items` was allocated by `alloc`.
+let mut items = unsafe { my_struct.items.as_vec_mut_in(&mut my_struct.item_len, alloc) };
+items.push_back(item);
+```
+
+The constructors are `unsafe` because the functions must behave like C's: for
+example, they must be thread-safe, since `CLikeAlloc` is `Send` and `Sync`.
+Unlike `LibcAlloc`, `CLikeAlloc` is not zero-sized and needs its `free` function
+to deallocate, so it does not implement `DropByPtrAllocator` and cannot be used
+with `OwnedCBufPtr`.
 
 ### C Strings — `CStrRef<'a>`
 

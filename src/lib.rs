@@ -57,7 +57,8 @@
 //! All vector operations default to the **C allocator** (`malloc`/`free`) for allocations,
 //! ensuring compatibility with memory managed across the FFI boundary, and support custom
 //! [`Allocator`] implementations via `as_vec_mut_in`, `clone_and_leak_in`, and
-//! `clone_from_slice_in`.
+//! `clone_from_slice_in`. To allocate with custom C allocation functions, such as memory hooks
+//! installed by C callers, use [`CLikeAlloc`] instead of the default, zero-sized [`LibcAlloc`].
 
 pub(crate) mod alloc;
 pub(crate) mod c_buf;
@@ -71,7 +72,9 @@ pub(crate) mod raw;
 pub(crate) mod testing;
 pub(crate) mod tracker;
 
-pub use alloc::{CBox, CVec, DropByPtrAllocator, LibcAlloc};
+pub use alloc::{
+    CBox, CLikeAlloc, CVec, CallocFn, DropByPtrAllocator, FreeFn, LibcAlloc, MallocFn,
+};
 pub use allocator_api2::alloc::Allocator;
 pub use c_buf::{CBufLen, CBufPtr, OwnedCBufPtr};
 pub use c_str::CStrRef;
