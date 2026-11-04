@@ -71,24 +71,27 @@ access and manipulation.
 *   **`CBufPtr<T, A = LibcAlloc>`**: Unowned buffer pointer wrapper
     (`#[repr(transparent)]` around `*mut T`). Does not deallocate on drop.
 
-    *   `with_len(len)` → `&[T]` — shared slice view for any `len: L` where `L:
-        CBufLen`.
+    *   `with_len(len)` → `&[T]` — shared slice view for any `len: L` where
+        `L: CBufLen`.
     *   `with_len_mut(len)` → `&mut [T]` — mutable slice view for any `len: L`
-        where `L: CBufLen` and `A = LibcAlloc`.
-    *   `as_vec_mut(&mut len)` → `CVecRefMut<'_, T, L, A>` — mutable vector
-        handle for any `L: CBufLen` (when `A: Default`).
+        where `L: CBufLen`.
+    *   `as_vec_mut(&mut len)` → `CVecRefMut<'_, T, L>` — mutable vector handle
+        for any `L: CBufLen` where `A = LibcAlloc`.
     *   `as_vec_mut_in(&mut len, alloc)` → `CVecRefMut<'_, T, L, A>` — mutable
         vector handle with custom allocator instance.
-    *   `as_vec_mut_with_cap(&mut len, &mut cap)` → `CVecRefMut<'_, T, L, A, C>`
-        — capacity-tracking mutable vector handle. The extra `cap: C` field lets
-        `push_back` reuse spare capacity and grow geometrically, saving
-        reallocations.
-    *   `as_vec_mut_with_cap_in(&mut len, &mut cap, alloc)` → `CVecRefMut<'_, T,
-        L, A, C>` — capacity-tracking handle with a custom allocator instance.
+    *   `as_vec_mut_with_cap(&mut len, &mut cap)` →
+        `CVecRefMut<'_, T, L, LibcAlloc, C>` — capacity-tracking mutable vector
+        handle where `A = LibcAlloc`. The extra `cap: C` field lets `push_back`
+        reuse spare capacity and grow geometrically, saving reallocations.
+    *   `as_vec_mut_with_cap_in(&mut len, &mut cap, alloc)` →
+        `CVecRefMut<'_, T, L, A, C>` — capacity-tracking handle with a custom
+        allocator instance.
     *   `clone_and_leak(&[T])` → `CBufPtr<T>` — create a new CBufPtr by cloning
         an existing slice using `LibcAlloc`.
     *   `clone_and_leak_in(&[T], alloc)` → `CBufPtr<T, A>` — create a new
         CBufPtr by cloning an existing slice using a custom allocator.
+    *   `try_clone_and_leak[_in]` — fallible variants of the above that return
+        `Err(AllocError)` instead of panicking if allocation fails.
     *   `from_boxed_slice(Box<[T], A>)` → `CBufPtr<T, A>` — create a new CBufPtr
         from a `Box<[T]>`, transferring ownership.
 
@@ -158,6 +161,81 @@ impl MyStruct {
 ```
 
 See [`examples/c_buf_ptr/`](examples/c_buf_ptr/) for a full example.
+
+#### Custom C allocators — `CLikeAlloc`
+
+Many C libraries let callers install their own memory allocation functions.
+`CLikeAlloc<F>` wraps them in an `Allocator` that can be passed to the `*_in`
+methods above, or used as `CBox<T, CLikeAlloc<F>>` and `CVec<T, CLikeAlloc<F>>`.
+`F` implements the `AllocFns` trait; `CustomFns` does so for a `malloc`- or
+`calloc`-like function and a `free`-like function:
+
+```rust
+// SAFETY: `hooks.calloc` and `hooks.free` behave like C's `calloc` and `free`
+// and are thread-safe.
+let alloc = unsafe { CLikeAlloc::new_with_calloc(hooks.calloc, hooks.free) };
+// SAFETY: `items` holds `item_len` elements allocated with `hooks.calloc`.
+let mut items = unsafe { my_struct.items.as_vec_mut_in(&mut my_struct.item_len, alloc) };
+items.push_back(item);
+```
+
+For allocation hooks with other signatures, such as ones that take a context
+pointer, implement `AllocFns` for a type that holds them. For example, for the
+allocation hooks of a miniz `mz_stream`:
+
+```rust
+#[derive(Clone, Copy)]
+struct MzHooks {
+    zalloc: MzAllocFunc,
+    zfree: MzFreeFunc,
+    opaque: *mut c_void,
+}
+
+impl MzHooks {
+    /// # Safety
+    ///
+    /// `zalloc(opaque, 1, n)` and `zfree(opaque, ptr)` must behave like C's
+    /// `malloc(n)` and `free(ptr)` while any copy of the result exists.
+    unsafe fn new(zalloc: MzAllocFunc, zfree: MzFreeFunc, opaque: *mut c_void) -> Self {
+        Self { zalloc, zfree, opaque }
+    }
+}
+
+// SAFETY: Every `MzHooks` comes from `MzHooks::new`, so its hooks behave like
+// `malloc` and `free`. As `MzHooks` holds raw pointers, it is neither `Send`
+// nor `Sync`.
+unsafe impl AllocFns for MzHooks {
+    fn malloc(&self, size: usize) -> *mut c_void {
+        // SAFETY: `zalloc` can be called like `malloc` (see `MzHooks::new`).
+        unsafe { (self.zalloc)(self.opaque, 1, size) }
+    }
+
+    unsafe fn free(&self, ptr: *mut c_void) {
+        // SAFETY: `zfree` can be called like `free` (see `MzHooks::new`), and
+        // the caller ensures that `ptr` may be passed to it.
+        unsafe { (self.zfree)(self.opaque, ptr) }
+    }
+}
+
+// SAFETY: The stream's hooks behave like C's `malloc` and `free` while any copy
+// of `hooks` exists.
+let hooks = unsafe { MzHooks::new(stream.zalloc, stream.zfree, stream.opaque) };
+let alloc = CLikeAlloc::new(hooks);
+```
+
+`AllocFns` also has `calloc` and `realloc` methods, which default to
+implementations on top of `malloc` and `free`. Override them if the C library
+has hooks for them, so that `CLikeAlloc` can, for example, grow blocks in place.
+
+`AllocFns` is an `unsafe` trait because its methods must behave like C's: for
+example, they must be thread-safe if `F` is `Send` or `Sync`, as `CLikeAlloc<F>`
+then is too. A type that holds hooks from C, like `MzHooks`, therefore keeps its
+fields private and has an `unsafe` constructor.
+
+`LibcAlloc` is `CLikeAlloc<LibcFns>`, where `LibcFns` calls the C standard
+library's allocation functions; use the `LibcAlloc` constant. Other
+`CLikeAlloc`s need their `F` to deallocate, so unlike `LibcAlloc`, they do not
+implement `DropByPtrAllocator` and cannot be used with `OwnedCBufPtr`.
 
 ### C Strings — `CStrRef<'a>`
 

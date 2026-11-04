@@ -56,7 +56,7 @@ pub(crate) fn malloc_array_typed<T, L: CBufLen, const N: usize>(
     for (i, v) in values.into_iter().enumerate() {
         unsafe { core::ptr::write(p.add(i), v) };
     }
-    let len = L::try_from(N).ok().expect("valid len");
+    let len = L::try_from(N).expect("valid len");
     Ok((unsafe { CBufPtr::from_raw(p) }, len))
 }
 
