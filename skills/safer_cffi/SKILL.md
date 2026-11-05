@@ -51,7 +51,13 @@ Core modules (`decoder.rs`, ...)       | The algorithm, written against slices, 
     core.
 *   **Wrappers stay thin.** No algorithm logic in the FFI layer: if a wrapper
     grows beyond argument unpacking and error mapping, move the logic into the
-    core where `forbid(unsafe_code)` applies.
+    core where `forbid(unsafe_code)` applies. Do not create internal helpers in
+    the FFI layer. Move them into the core.
+*   When an `unsafe extern "C" fn` must accept raw `(ptr, len)` parameters,
+    convert `(ptr, len)` to `&[T]` / `&mut [T]` once at the top of the
+    `extern "C"` entry point.
+*   **Never decay `&mut Context` to raw pointers (`*mut Context`, `*mut State`)
+    to work around the borrow checker across C callbacks.**
 *   **Never hide `unsafe` behind "safe" helper functions.** Do not centralise
     raw-pointer operations (`ptr.as_mut()`, `Box::from_raw`,
     `slice::from_raw_parts`, `ptr::copy_nonoverlapping`, `CStr::from_ptr`) into
@@ -96,23 +102,30 @@ field's safety-invariant comment (see below).
 C construct                             | Rust spelling                                   | Notes
 :-------------------------------------- | :---------------------------------------------- | :----
 Opaque `typedef struct Foo Foo; Foo*`   | `Handle<Foo>`                                   | Managed by an `OpaqueTracker<Foo>`. Not `Option`: a null handle is `Handle::null()`.
+`typedef struct Foo* foo_ptr;`          | `pub type foo_ptr<'a> = Option<&'a mut Foo>;`   | Or `Option<&'a Foo>` if `const`. Never `pub type foo_ptr = *mut Foo;`.
+`typedef T* row_ptr;` (array typedef)   | `pub type row_ptr = CBufPtr<T>;`                | For array pointer typedefs.
+`void (*cb)(T*, ...)` callback          | `Option<unsafe extern "C" fn(Option<&mut T>)>`  | Apply the same parameter/return rows to C callback `fn` pointer fields and typedefs.
 `const T*` parameter                    | `Option<&T>`                                    | `None` is NULL. Also `Option<&[T; N]>` for fixed-size arrays. Not if the call frees or moves what it may point to, see [Aliased arguments](#aliased-arguments).
 `T*` parameter, caller keeps ownership  | `Option<&mut T>`                                | Also `Option<&mut [T; N]>`.
 `T*` out-parameter, possibly uninit     | `Option<&mut T>`                                | `*p = v`; never read before writing. If `T` has drop glue, use `Option<&mut MaybeUninit<T>>` + `p.write(v)`. Write it on the same paths as C, see [Out-parameters](#out-parameters-and-error-paths).
 `T*` whose ownership moves to Rust      | `Option<Box<T>>` / `Option<CBox<T>>`            | `Box` if *Rust* allocated it with `Box`; `CBox` if allocated with `malloc`/`CBox`.
 `const char*` parameter                 | `Option<CStrRef<'_>>`                           | `.to_c_str()` / `.to_bytes()`. Never `&CStr` or `&str` (fat pointers, wrong ABI).
-`T* items; int len;` struct fields      | `OwnedCBufPtr<T>` (`T: Copy`) or `CBufPtr<T>`   | Plus the original `len` field, see below.
+`T* items; int len;` struct fields      | `OwnedCBufPtr<T>` (`T: Copy`) or `CBufPtr<T>`   | Plus the original `len` field, see below. Never use `CBufPtr<T>` for a single object.
 `T** items, int* len` parameters        | `Option<&mut CBufPtr<T>>`, `Option<&mut c_int>` | C-owned array Rust appends to, see below.
 `T*` field pointing at one Rust object  | `Option<Box<T>>` / `Option<CBox<T>>`            | Dropped automatically with the parent struct.
-`T*` returned to C that C will `free()` | `Option<CBox<T>>` / `CBufPtr::clone_and_leak`   | Both allocate with `malloc` so C's `free` is correct.
+`T*` returned to C that C will `free()` | `Option<CBox<T>>` / `OwnedCBufPtr<T>`           |
+`T*` / `const T*` returned (borrowed)   | `Option<&'a mut T>` / `Option<&'a T>`           | Never return `*mut T` or `*const T`, always encode ownership assumptions.
 
-Return types follow the same rows: `-> Handle<Foo>`, `-> Option<Box<T>>`, `->
-i32`, ... Use exact-width types that match the header (`i32` for `int32_t`,
-`core::ffi::c_int` for `int`); a `u32` vs `int32_t` mismatch is an ABI bug even
-though it links.
-
-References (`Option<&T>`, `Option<&mut T>`) are for *parameters only*. Struct
-fields need owning or raw types because they outlive the call.
+*   **Never define raw-pointer `type` aliases (`pub type foo_ptr = *mut Foo`).**
+    Keeping `*mut` in the Rust `type` alias hides a raw pointer and forces
+    unsafe. Use `pub type foo_ref<'a> = Option<&'a mut Foo>;` or `CBufPtr<T>`
+    for array/row typedefs.
+*   **Never return raw pointers (`-> *mut T` or `-> *const T`).** Every return
+    type must express its ownership or borrow: `-> Handle<Foo>`,
+    `-> Option<Box<T>>`, `-> Option<CBox<T>>`, `-> OwnedCBufPtr<T>`,
+    `-> Option<&'a mut T>` / `-> Option<&'a T>`. Use exact-width primitive types
+    that match the header (`i32` for `int32_t`, `core::ffi::c_int` for `int`); a
+    `u32` vs `int32_t` mismatch is an ABI bug even though it links.
 
 ## Opaque objects: `OpaqueTracker` + `Handle`
 
@@ -546,6 +559,9 @@ Replacing or freeing a field while a parameter may point to it (`f(g, g->map)`) 
 Returning an out-param in `Ok(..)`, or splitting the core function around it         | Pass it into the core as `&mut T` and write it where C does                           | C may store it before a later step fails; the core keeps C's control flow.
 Safe `extern "C" fn` that trusts one parameter to match another (slot + count)       | `unsafe extern "C" fn` with a `# Safety` section                                      | Safe Rust callers could pass mismatched values.
 "Safe" helpers for raw pointers (`ptr_as_mut`, `slice_from_raw`, `box_from_raw`)     | Ditch the helper (use safe signature types or inline `unsafe`), or mark `unsafe fn`   | They have safety preconditions; omitting `unsafe` hides unsoundness behind a safe API.
+`pub type foo_ptr = *mut Foo;` for a C pointer `typedef`                             | `pub type foo_ptr<'a> = Option<&'a mut Foo>;` (or `CBufPtr<T>` for array typedefs)    | Raw-pointer aliases hide `*mut` behind a C name and infect every function and callback using the alias with `unsafe`.
+Returning `*mut T` or `*const T` from an `extern "C"` fn, callback, or helper        | Return `Option<Box<T>>`, `Option<CBox<T>>`, `OwnedCBufPtr<T>`, `CBufPtr<T>`, or `&T`  | Raw pointer returns erase ownership and lifetime contracts and force callers into `unsafe`.
+Raw pointers (`*mut T`, `*const T`) in C callback `fn` pointer fields or typedefs    | `Option<unsafe extern "C" fn(ctx: Option<&mut Foo>, ...)>`                            | Callbacks implemented in or called from Rust then use safe references instead of raw pointer dereferences.
 Wrapping a whole function body or surrounding safe code in `unsafe { ... }`          | Put only the single `unsafe` invocation inside `unsafe { ... }`                       | Large `unsafe` blocks obscure which call has preconditions and disable safety checks across safe code.
 Resetting the count or returning early when the array is null but the count is not   | Let `as_vec_mut` panic                                                                | The struct is already corrupt, and C only copes with it by accident.
 Hardcoding `LibcAlloc` / `OwnedCBufPtr` when a C struct has `alloc`/`free` hooks     | Wrap the hooks in `CLikeAlloc<F>` (see `src/alloc.rs`) and use `CBufPtr` + `*_in`     | Callers and leak tests hook those callbacks; stateful `CLikeAlloc<F>`s do not implement `DropByPtrAllocator`.
