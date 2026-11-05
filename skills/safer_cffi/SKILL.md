@@ -266,13 +266,15 @@ impl IntArray {
 ```
 
 *   **`OwnedCBufPtr<T>` when `T: Copy`.** Always prefer `OwnedCBufPtr<T>` for
-    owned buffers of `Copy` elements (e.g. `u8` byte buffers). It automatically
-    frees the buffer on drop without needing the length, so it does not require
-    a `Drop` impl that `clear()`s it. Build one from a `CVec<T>` (`Vec<T,
-    LibcAlloc>`) with `OwnedCBufPtr::from_boxed_slice(v.into_boxed_slice())`, or
-    copy a slice with `OwnedCBufPtr::clone_from_slice(src)`
-    (`try_clone_from_slice` on fallible paths), and set the length field to the
-    element count.
+    owned buffers of `Copy` elements (e.g. `u8` byte buffers), unless the C API
+    uses custom allocator callbacks with runtime state (see
+    [Allocation across the boundary](#allocation-across-the-boundary)). It
+    automatically frees the buffer on drop without needing the length, so it
+    does not require a `Drop` impl that `clear()`s it. Build one from a
+    `CVec<T>` (`Vec<T, LibcAlloc>`) with
+    `OwnedCBufPtr::from_boxed_slice(v.into_boxed_slice())`, or copy a slice with
+    `OwnedCBufPtr::clone_from_slice(src)` (`try_clone_from_slice` on fallible
+    paths), and set the length field to the element count.
 *   **`CBufPtr<T>` when elements need dropping (`T: !Copy`)** (e.g. an array of
     structs that themselves own nested buffers). Because `Drop` must run on each
     element before freeing the array, `OwnedCBufPtr` cannot be used; add an
@@ -371,9 +373,17 @@ mimalloc). `safer_cffi` defaults everything C-facing to `LibcAlloc`:
     `v.try_reserve_exact(n).map_err(..)?; v.resize(n, 0);`.
 *   `CBufPtr::clone_and_leak(&[T])` for malloc-backed arrays (including
     nul-terminated `c_char` strings). `try_clone_and_leak` for fallible paths.
-*   A custom `Allocator` is supported via the `*_in` variants (`as_vec_mut_in`,
-    `clone_and_leak_in`) and `OwnedCBufPtr<T, A: DropByPtrAllocator>`; pass the
-    *same* allocator instance every time.
+*   **Custom C allocators (`CLikeAlloc<F>`):** inspect user-facing options and
+    state structs for custom `alloc`/`free` hooks before choosing buffer types.
+    Wrap plain function pointers with `CLikeAlloc<CustomFns>` (`new_with_malloc`
+    / `new_with_calloc`), or implement `unsafe impl AllocFns` for hooks with a
+    context pointer (keeping fields private behind an `unsafe` constructor; see
+    `README.md` and `src/alloc.rs`). Pass the *same* `CLikeAlloc<F>` instance
+    (or call an `.allocator()` accessor on the struct) to `CBox<T, A>`,
+    `CVec<T, A>`, and the `*_in` methods (`as_vec_mut_in`,
+    `as_vec_mut_with_cap_in`, `clone_and_leak_in`), and use
+    `CBufPtr<T, CLikeAlloc<F>>` instead of `OwnedCBufPtr` (stateful
+    `CLikeAlloc`s do not implement `DropByPtrAllocator`).
 
 ## Matching C behaviour
 
@@ -538,3 +548,4 @@ Safe `extern "C" fn` that trusts one parameter to match another (slot + count)  
 "Safe" helpers for raw pointers (`ptr_as_mut`, `slice_from_raw`, `box_from_raw`)     | Ditch the helper (use safe signature types or inline `unsafe`), or mark `unsafe fn`   | They have safety preconditions; omitting `unsafe` hides unsoundness behind a safe API.
 Wrapping a whole function body or surrounding safe code in `unsafe { ... }`          | Put only the single `unsafe` invocation inside `unsafe { ... }`                       | Large `unsafe` blocks obscure which call has preconditions and disable safety checks across safe code.
 Resetting the count or returning early when the array is null but the count is not   | Let `as_vec_mut` panic                                                                | The struct is already corrupt, and C only copes with it by accident.
+Hardcoding `LibcAlloc` / `OwnedCBufPtr` when a C struct has `alloc`/`free` hooks     | Wrap the hooks in `CLikeAlloc<F>` (see `src/alloc.rs`) and use `CBufPtr` + `*_in`     | Callers and leak tests hook those callbacks; stateful `CLikeAlloc<F>`s do not implement `DropByPtrAllocator`.
