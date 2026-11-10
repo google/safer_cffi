@@ -237,6 +237,9 @@ library's allocation functions; use the `LibcAlloc` constant. Other
 `CLikeAlloc`s need their `F` to deallocate, so unlike `LibcAlloc`, they do not
 implement `DropByPtrAllocator` and cannot be used with `OwnedCBufPtr`.
 
+See [`examples/custom_allocator/`](examples/custom_allocator/) for a full
+example.
+
 ### C Strings — `CStrRef<'a>`
 
 A `#[repr(transparent)]` wrapper around `NonNull<c_char>` that can be used as

@@ -5,9 +5,10 @@ description: >-
   crate structure (safe core vs. thin FFI layer, naming), opaque object handles
   (OpaqueTracker, Handle), nullable-pointer parameter idioms (Option-wrapped
   references, boxes and CStrRef), pointer+length array fields in repr(C) structs
-  (CBufPtr, OwnedCBufPtr, CVecRefMut) backed by the C allocator, and matching C
-  behaviour (out-params on error paths, partially-initialised input structs,
-  aliased arguments, panics). Use when
+  (CBufPtr, OwnedCBufPtr, CVecRefMut), memory that C allocates or frees and
+  custom allocation hooks (LibcAlloc, CLikeAlloc), and matching C behaviour
+  (out-params on error paths, partially-initialised input structs, aliased
+  arguments, panics). Use when
   designing or porting a Rust drop-in replacement of a C library, writing or
   reviewing no_mangle extern "C" functions, repr(C) structs, or
   create/borrow/destroy object lifecycles, when choosing between raw pointers
@@ -27,7 +28,8 @@ invariant. Reach for it whenever a C API is being reimplemented in Rust.
 
 Working examples for every pattern live in the crate's `examples/` directory
 (`opaque_tracker`, `raw_tracker`, `functions`, `c_buf_ptr`,
-`c_buf_ptr_with_capacity`). Copy from them rather than from memory.
+`c_buf_ptr_with_capacity`, `custom_allocator`). Copy from them rather than from
+memory.
 
 ## Crate layout
 
@@ -370,33 +372,74 @@ impl IntArray {
 
 ## Allocation across the boundary
 
-Memory that C will `free()` must come from `malloc`; memory Rust `Box`es must
-come from the Rust allocator (which need not be libc's, e.g. under jemalloc or
-mimalloc). `safer_cffi` defaults everything C-facing to `LibcAlloc`:
+Memory must be freed by the allocator that allocated it. C's `free()` needs
+memory from `malloc`, while `Box` and `Vec` use Rust's global allocator, which
+need not be libc's (e.g. under jemalloc or mimalloc). Choose the allocator by
+who manages the memory:
 
-*   `CBox<T>` (`Box<T, LibcAlloc>`): `CBox::new_in(v, LibcAlloc)`; use
-    `Option<CBox<T>>` directly in `extern "C"` signatures and `#[repr(C)]`
-    struct fields (or `CBox::into_raw(b)` / `CBox::from_raw_in(p, LibcAlloc)`
-    when converting to/from `*mut T`).
-*   `CVec<T>` (`Vec<T, LibcAlloc>`): `CVec::new_in(LibcAlloc)`, build it up with
-    the usual `Vec` API, then hand it over with
-    `CBufPtr`/`OwnedCBufPtr::from_boxed_slice(v.into_boxed_slice())`.
-*   Buffers whose size C controls (e.g. `Width * Height`): reserve before
-    filling, so that a huge size is an error code rather than an abort:
-    `v.try_reserve_exact(n).map_err(..)?; v.resize(n, 0);`.
-*   `CBufPtr::clone_and_leak(&[T])` for malloc-backed arrays (including
-    nul-terminated `c_char` strings). `try_clone_and_leak` for fallible paths.
-*   **Custom C allocators (`CLikeAlloc<F>`):** inspect user-facing options and
-    state structs for custom `alloc`/`free` hooks before choosing buffer types.
-    Wrap plain function pointers with `CLikeAlloc<CustomFns>` (`new_with_malloc`
-    / `new_with_calloc`), or implement `unsafe impl AllocFns` for hooks with a
-    context pointer (keeping fields private behind an `unsafe` constructor; see
-    `README.md` and `src/alloc.rs`). Pass the *same* `CLikeAlloc<F>` instance
-    (or call an `.allocator()` accessor on the struct) to `CBox<T, A>`,
-    `CVec<T, A>`, and the `*_in` methods (`as_vec_mut_in`,
-    `as_vec_mut_with_cap_in`, `clone_and_leak_in`), and use
-    `CBufPtr<T, CLikeAlloc<F>>` instead of `OwnedCBufPtr` (stateful
-    `CLikeAlloc`s do not implement `DropByPtrAllocator`).
+*   **Managed entirely by Rust** (C may read or write it, but never frees or
+    reallocates it): the usual `Box`, `Vec`, `String`, and so on, including
+    objects behind a `Handle` and Rust objects in `Option<Box<T>>` fields.
+*   **Allocated or freed by C**, including C callers that `free()` what the API
+    returns or pass in memory from `malloc`: `LibcAlloc`.
+*   **Managed by custom allocation hooks** that the C library lets callers
+    install: `CLikeAlloc`.
+
+### `LibcAlloc`: memory that C allocates or frees
+
+`LibcAlloc` is a zero-sized allocator over libc's `malloc`, `calloc`, `realloc`
+and `free`. It is the default allocator of `CBufPtr`, `OwnedCBufPtr` and
+`CVecRefMut`; their methods without an `_in` suffix (`as_vec_mut`,
+`clone_and_leak`, ...) use it. `CBox<T>` and `CVec<T>` are the standard
+library's `Box<T, LibcAlloc>` and `Vec<T, LibcAlloc>`: create them with the
+`*_in` constructors and the `LibcAlloc` constant, then use the usual `Box` and
+`Vec` API.
+
+```rust
+use safer_cffi::{CBox, CVec, LibcAlloc, OwnedCBufPtr};
+
+// A single object.
+let item = CBox::new_in(Item::default(), LibcAlloc);
+
+// An array that C may free(): build a `CVec`, then hand over its allocation.
+let mut raster = CVec::new_in(LibcAlloc);
+raster.try_reserve_exact(size).map_err(|_| Error::NoMem)?;
+raster.resize(size, 0);
+image.RasterBits = OwnedCBufPtr::from_boxed_slice(raster.into_boxed_slice());
+```
+
+*   **Copy global-allocator memory, never convert it.** `vec![]`, `.to_vec()`,
+    `.collect()` and `Box::new` allocate with the global allocator: build a
+    `CVec` instead, or copy with `OwnedCBufPtr::clone_from_slice` /
+    `CBufPtr::clone_and_leak`.
+*   **Allocate large state zeroed, in place.** Rust has no placement `new`:
+    `CBox::new_in(State::new(), alloc)` builds the value on the stack first
+    (debug builds always do), which can overflow C threads' stacks for state of
+    hundreds of KB. If this is a concern, derive `zerocopy::FromZeros`, which
+    checks every field at compile time.
+*   **`Option<CBox<T>>` is pointer-sized** because `LibcAlloc` is zero-sized, so
+    it can replace a `T*` field in a `#[repr(C)]` struct.
+
+### `CLikeAlloc`: custom allocation hooks
+
+Many C libraries let callers install their own allocation functions, which must
+then allocate and free everything that crosses the boundary. `CLikeAlloc<F>`
+wraps such hooks in an `Allocator` (`LibcAlloc` is `CLikeAlloc<LibcFns>`). For
+plain `malloc`- or `calloc`-like and `free`-like function pointers, create a
+`CLikeAlloc<CustomFns>` with `new_with_malloc` or `new_with_calloc`, and pass it
+to the `*_in` methods and constructors:
+
+```rust
+use safer_cffi::{CBox, CLikeAlloc};
+
+// SAFETY: `hooks.malloc_fn` and `hooks.free_fn` behave like libc's equivalents.
+let alloc = unsafe { CLikeAlloc::new_with_malloc(hooks.malloc_fn, hooks.free_fn) };
+
+let item = CBox::new_in(Item::default(), alloc);
+```
+
+See the custom_allocator example for more details, including how to use
+`CLikeAlloc` with a context pointer.
 
 ## Matching C behaviour
 
@@ -565,3 +608,4 @@ Raw pointers (`*mut T`, `*const T`) in C callback `fn` pointer fields or typedef
 Wrapping a whole function body or surrounding safe code in `unsafe { ... }`          | Put only the single `unsafe` invocation inside `unsafe { ... }`                       | Large `unsafe` blocks obscure which call has preconditions and disable safety checks across safe code.
 Resetting the count or returning early when the array is null but the count is not   | Let `as_vec_mut` panic                                                                | The struct is already corrupt, and C only copes with it by accident.
 Hardcoding `LibcAlloc` / `OwnedCBufPtr` when a C struct has `alloc`/`free` hooks     | Wrap the hooks in `CLikeAlloc<F>` (see `src/alloc.rs`) and use `CBufPtr` + `*_in`     | Callers and leak tests hook those callbacks; stateful `CLikeAlloc<F>`s do not implement `DropByPtrAllocator`.
+`CBox::new_in(State::new(), alloc)` for state of hundreds of KB                      | `#[derive(FromZeros)]` and `try_new_zeroed_in`                                        | The value is built on the stack first, which overflows C threads' stacks.
