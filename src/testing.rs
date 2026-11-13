@@ -13,7 +13,7 @@
 
 use crate::alloc::LibcAlloc;
 use crate::c_buf::{CBufLen, CBufPtr};
-use allocator_api2::alloc::{AllocError, Allocator, Layout};
+use core::alloc::{AllocError, Allocator, Layout};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::ffi::c_int;

@@ -76,10 +76,10 @@ pub use alloc::{
     AllocFns, CBox, CLikeAlloc, CVec, CallocFn, CustomFns, DropByPtrAllocator, FreeFn, LibcAlloc,
     LibcFns, MallocFn,
 };
-pub use allocator_api2::alloc::Allocator;
 pub use c_buf::{CBufLen, CBufPtr, OwnedCBufPtr};
 pub use c_str::CStrRef;
 pub use c_vec::CVecRefMut;
+pub use core::alloc::Allocator;
 pub use errors::{AllocError, TrackerError};
 pub use handle::Handle;
 pub use opaque::OpaqueTracker;

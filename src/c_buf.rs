@@ -76,8 +76,7 @@
 use crate::alloc::{DropByPtrAllocator, LibcAlloc};
 use crate::c_vec::CVecRefMut;
 use crate::errors::AllocError;
-use allocator_api2::alloc::{Allocator, Layout};
-use allocator_api2::boxed;
+use core::alloc::{Allocator, Layout};
 use core::fmt;
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
@@ -258,14 +257,11 @@ impl<T, A: Allocator> CBufPtr<T, A> {
     ///
     /// The boxed slice is leaked, so the caller must ensure that the returned `CBufPtr` is freed
     /// appropriately.
-    pub fn from_boxed_slice(slice: boxed::Box<[T], A>) -> Self {
-        // TODO: Simplify to checking `slice.is_empty()` first when we drop allocator_api2.
-        // `allocator_api2::boxed::Box::drop` incorrectly calls `Allocator::deallocate`
-        // even for zero-sized layouts that were never allocated
-        let raw = boxed::Box::into_raw(slice);
-        if raw.is_empty() {
+    pub fn from_boxed_slice(slice: Box<[T], A>) -> Self {
+        if slice.is_empty() {
             return Self::null();
         }
+        let (raw, _alloc) = Box::into_raw_with_allocator(slice);
         // SAFETY: `raw` is non-empty and `T` is not zero-sized, so it is a non-null, aligned
         // pointer to `raw.len()` initialised elements allocated by `A` with
         // `Layout::array::<T>(raw.len())`.
@@ -673,7 +669,7 @@ impl<T: Copy, A: DropByPtrAllocator> OwnedCBufPtr<T, A> {
     /// Construct an `OwnedCBufPtr` from a boxed slice.
     ///
     /// The `OwnedCBufPtr` takes ownership of the buffer backing the boxed slice.
-    pub fn from_boxed_slice(slice: boxed::Box<[T], A>) -> Self {
+    pub fn from_boxed_slice(slice: Box<[T], A>) -> Self {
         Self(CBufPtr::from_boxed_slice(slice))
     }
 
@@ -880,7 +876,7 @@ mod tests {
     #[gtest]
     fn from_boxed_slice_empty_is_null() {
         let alloc = TrackingAlloc::default();
-        let boxed = allocator_api2::vec::Vec::<i32, _>::new_in(&alloc).into_boxed_slice();
+        let boxed = Vec::<i32, _>::new_in(&alloc).into_boxed_slice();
         let ptr = CBufPtr::from_boxed_slice(boxed);
         assert!(ptr.is_null());
         assert_that!(alloc.alloc_count.load(Ordering::SeqCst), eq(0));

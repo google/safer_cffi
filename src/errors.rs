@@ -27,4 +27,4 @@ impl<K: core::fmt::Debug> core::fmt::Display for TrackerError<K> {
 
 impl<K: core::fmt::Debug> std::error::Error for TrackerError<K> {}
 
-pub use allocator_api2::alloc::AllocError;
+pub use core::alloc::AllocError;

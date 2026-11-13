@@ -8,9 +8,7 @@
 
 //! Memory allocator implementations for C FFI interoperability.
 
-use allocator_api2::alloc::{AllocError, Allocator, Layout};
-use allocator_api2::boxed::Box;
-use allocator_api2::vec::Vec;
+use core::alloc::{AllocError, Allocator, Layout};
 use core::ffi::c_void;
 use core::ptr::NonNull;
 use libc::size_t;

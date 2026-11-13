@@ -16,7 +16,7 @@
 
 use crate::alloc::LibcAlloc;
 use crate::c_buf::{max_slice_len, CBufLen, CBufPtr};
-use allocator_api2::alloc::{Allocator, Layout};
+use core::alloc::{Allocator, Layout};
 use core::ptr::{self, NonNull};
 
 /// The minimum non-zero capacity to allocate when a capacity-tracking vector
