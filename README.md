@@ -24,6 +24,7 @@ prevent concurrent mutable access.
 Both trackers implement the `Tracker<T>` trait, which provides:
 
 *   `register(Box<T>)` → Key — stores the object, returns a key for C.
+*   `borrow(key)` → `TrackedRef<T>` — shared access via a RAII guard.
 *   `borrow_mut(key)` → `Tracked<T>` — exclusive access via a RAII guard.
 *   `reclaim(key)` → `Box<T>` — takes back ownership, removing from tracker.
 

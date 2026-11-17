@@ -84,4 +84,4 @@ pub use errors::{AllocError, TrackerError};
 pub use handle::Handle;
 pub use opaque::OpaqueTracker;
 pub use raw::RawTracker;
-pub use tracker::{Tracked, Tracker};
+pub use tracker::{Tracked, TrackedRef, Tracker};

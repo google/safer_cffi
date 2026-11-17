@@ -29,7 +29,7 @@ pub extern "C" fn free_struct(s: *mut MyStruct) {
 #[unsafe(no_mangle)]
 pub extern "C" fn print_struct(s: *mut MyStruct) {
     // This will fail if `s` has not been created by `new_struct`.
-    if let Ok(s) = TRACKER.borrow_mut(s) {
+    if let Ok(s) = TRACKER.borrow(s) {
         println!("MyStruct field: {}", s.field);
     }
 }
