@@ -7,7 +7,9 @@
 // except according to those terms.
 
 use crate::errors::TrackerError;
+use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
 
 /// A trait for managing the lifecycle of Rust objects across FFI boundaries.
 ///
@@ -29,6 +31,19 @@ pub trait Tracker<T> {
     /// Fails if the object is currently borrowed.
     fn reclaim(&self, key: impl Into<Self::Key>) -> Result<Box<T>, TrackerError<Self::Key>>;
 
+    /// Borrows the object, returning a guard that gives shared immutable access.
+    ///
+    /// Returns a `TrackedRef` guard that implements `Deref`. Multiple shared borrows of the same
+    /// object can exist concurrently, and the borrow is released when the guard is dropped.
+    ///
+    /// Fails if the object is currently borrowed mutably.
+    fn borrow(
+        &self,
+        key: impl Into<Self::Key>,
+    ) -> Result<TrackedRef<'_, T, Self>, TrackerError<Self::Key>>
+    where
+        Self: Sized;
+
     /// Borrows the object, returning a guard that gives mutable access.
     ///
     /// Returns a `Tracked` guard that implements `DerefMut`. When the guard is dropped,
@@ -45,7 +60,29 @@ pub trait Tracker<T> {
     /// Returns the borrowed object back to the tracker.
     /// This should only be called by the `Drop` implementation of the `Tracked` guard.
     #[doc(hidden)]
-    fn return_mut(&self, key: Self::Key, val: Box<T>);
+    fn return_mut(&self, key: Self::Key, val: Arc<T>);
+}
+
+/// A guard that provides shared immutable access to a tracked object.
+///
+/// The shared borrow is released when this guard is dropped.
+pub struct TrackedRef<'a, T, Tr: Tracker<T>> {
+    val: Arc<T>,
+    _marker: PhantomData<&'a Tr>,
+}
+
+impl<'a, T, Tr: Tracker<T>> TrackedRef<'a, T, Tr> {
+    pub fn new(val: Arc<T>) -> Self {
+        Self { val, _marker: PhantomData }
+    }
+}
+
+impl<'a, T, Tr: Tracker<T>> Deref for TrackedRef<'a, T, Tr> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.val
+    }
 }
 
 /// A guard that provides mutable access to a tracked object.
@@ -54,11 +91,11 @@ pub trait Tracker<T> {
 pub struct Tracked<'a, T, Tr: Tracker<T>> {
     tracker: &'a Tr,
     key: Tr::Key,
-    val: Option<Box<T>>,
+    val: Option<Arc<T>>,
 }
 
 impl<'a, T, Tr: Tracker<T>> Tracked<'a, T, Tr> {
-    pub fn new(tracker: &'a Tr, key: Tr::Key, val: Box<T>) -> Self {
+    pub fn new(tracker: &'a Tr, key: Tr::Key, val: Arc<T>) -> Self {
         Self { tracker, key, val: Some(val) }
     }
 }
@@ -67,13 +104,14 @@ impl<'a, T, Tr: Tracker<T>> Deref for Tracked<'a, T, Tr> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        self.val.as_ref().unwrap()
+        self.val.as_ref().expect("corrupted Tracked state: value is None")
     }
 }
 
 impl<'a, T, Tr: Tracker<T>> DerefMut for Tracked<'a, T, Tr> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.val.as_mut().unwrap()
+        let arc = self.val.as_mut().expect("corrupted Tracked state: value is None");
+        Arc::get_mut(arc).expect("corrupted Tracked state: value is shared")
     }
 }
 

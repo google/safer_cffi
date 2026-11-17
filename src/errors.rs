@@ -9,6 +9,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrackerError<K> {
     NotFound(K),
+    AlreadyBorrowedImmutably(K),
     AlreadyBorrowedMutably(K),
     CapacityExceeded,
 }
@@ -17,6 +18,9 @@ impl<K: core::fmt::Debug> core::fmt::Display for TrackerError<K> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::NotFound(key) => write!(f, "Key {:?} not tracked", key),
+            Self::AlreadyBorrowedImmutably(key) => {
+                write!(f, "Key {:?} is already borrowed immutably", key)
+            }
             Self::AlreadyBorrowedMutably(key) => {
                 write!(f, "Key {:?} is already borrowed mutably", key)
             }

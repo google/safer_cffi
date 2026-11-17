@@ -147,8 +147,14 @@ pub extern "C" fn new_counter() -> Handle<Counter> {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn get_counter(h: Handle<Counter>) -> u64 {
+    let Ok(c) = TRACKER.borrow(h) else { return 0 }; // NotFound / AlreadyBorrowedMutably
+    c.0
+} // guard drops here and releases the shared borrow
+
+#[unsafe(no_mangle)]
 pub extern "C" fn increase_counter(h: Handle<Counter>) -> u64 {
-    let Ok(mut c) = TRACKER.borrow_mut(h) else { return 0 }; // NotFound / AlreadyBorrowedMutably
+    let Ok(mut c) = TRACKER.borrow_mut(h) else { return 0 }; // NotFound / AlreadyBorrowed*
     c.0 += 1;
     c.0
 } // guard drops here and returns the object to the tracker
@@ -165,14 +171,19 @@ Rules that follow from how the tracker works:
     `extern "C"` function aborts the process. Map `TrackerError` to the C API's
     error convention (`0`, `-1`, `NULL`, `Handle::null()`). If the API must
     survive arbitrary panics, wrap the body in `std::panic::catch_unwind`.
-*   **`borrow_mut` is exclusive, not a lock.** It moves the object out of the
-    tracker; a second `borrow_mut` or a `reclaim` of the same handle while the
-    guard is alive returns `AlreadyBorrowedMutably` instead of blocking. So:
-    drop the `Tracked` guard *before* invoking C callbacks or calling other
-    entry points that may touch the same handle (extract what you need first).
-    Inside one entry point, borrow once and pass `&mut *guard` to helpers
-    instead of re-borrowing the handle. Different handles never contend beyond a
-    short internal mutex.
+*   **`borrow` is shared; `borrow_mut` is exclusive.** Neither blocks: `borrow`
+    allows multiple concurrent shared `TrackedRef` guards for the same handle
+    (failing with `AlreadyBorrowedMutably` only if a `Tracked` guard is alive),
+    whereas `borrow_mut` moves the object out of the tracker and fails with
+    `AlreadyBorrowedImmutably` or `AlreadyBorrowedMutably` if any shared or
+    mutable borrow of the same handle is alive (as does `reclaim`). Use `borrow`
+    for read-only entry points (such as `const Foo*` parameters) so concurrent
+    readers do not contend, and drop `Tracked` / `TrackedRef` guards *before*
+    invoking C callbacks or calling other entry points that may mutably borrow
+    or reclaim the same handle (extract what you need first). Inside one entry
+    point, borrow once and pass `&*guard` or `&mut *guard` to helpers instead of
+    re-borrowing the handle. Different handles never contend beyond a short
+    internal mutex.
 *   **One plain `static` tracker per Rust type.** `OpaqueTracker::new()` is
     `const`, so no `OnceLock`/`lazy_static` wrapper is needed. `register` fails
     with `CapacityExceeded` only after ~4 billion live objects.

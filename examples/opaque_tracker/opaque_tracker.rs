@@ -34,6 +34,14 @@ pub extern "C" fn free_counter(counter: safer_cffi::Handle<Counter>) {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn get_counter(counter: safer_cffi::Handle<Counter>) -> u64 {
+    let Ok(tracked) = TRACKER.borrow(counter) else {
+        return 0;
+    };
+    tracked.get()
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn increase_counter(counter: safer_cffi::Handle<Counter>) -> u64 {
     let Ok(mut tracked) = TRACKER.borrow_mut(counter) else {
         return 0;

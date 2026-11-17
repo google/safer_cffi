@@ -11,7 +11,7 @@ use crate::handle::Handle;
 use crate::tracker::Tracker;
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// A tracker that manages objects using generational handles (`Handle<T>`).
 pub struct OpaqueTracker<T> {
@@ -19,7 +19,7 @@ pub struct OpaqueTracker<T> {
 }
 
 struct Entry<T> {
-    value: Option<Box<T>>,
+    value: Option<Arc<T>>,
     generation: usize,
 }
 
@@ -64,7 +64,7 @@ impl<T> Tracker<T> for OpaqueTracker<T> {
         };
 
         let entry = &mut state.entries[index];
-        entry.value = Some(b);
+        entry.value = Some(Arc::from(b));
 
         let handle = Handle::new(index, entry.generation);
         Ok(handle)
@@ -95,7 +95,7 @@ impl<T> Tracker<T> for OpaqueTracker<T> {
             return Err(TrackerError::NotFound(key));
         }
 
-        let Some(val) = entry.value.take() else {
+        let Some(arc) = entry.value.take() else {
             std::hint::cold_path();
             log::error!(
                 "Failed to reclaim {}: AlreadyBorrowedMutably for key {:?}",
@@ -103,6 +103,20 @@ impl<T> Tracker<T> for OpaqueTracker<T> {
                 key
             );
             return Err(TrackerError::AlreadyBorrowedMutably(key));
+        };
+
+        let val = match Arc::try_unwrap(arc) {
+            Ok(val) => Box::new(val),
+            Err(arc) => {
+                entry.value = Some(arc);
+                std::hint::cold_path();
+                log::error!(
+                    "Failed to reclaim {}: AlreadyBorrowedImmutably for key {:?}",
+                    std::any::type_name::<T>(),
+                    key
+                );
+                return Err(TrackerError::AlreadyBorrowedImmutably(key));
+            }
         };
 
         if entry.generation < Handle::<T>::MAX_GENERATION {
@@ -113,6 +127,51 @@ impl<T> Tracker<T> for OpaqueTracker<T> {
         }
 
         Ok(val)
+    }
+
+    fn borrow(
+        &self,
+        key: impl Into<Self::Key>,
+    ) -> Result<crate::TrackedRef<'_, T, Self>, TrackerError<Self::Key>> {
+        let key = key.into();
+        let val = {
+            let state = self.state.lock().unwrap();
+            let index = key.index();
+
+            let Some(entry) = state.entries.get(index) else {
+                std::hint::cold_path();
+                log::error!(
+                    "Failed to borrow {}: NotFound for key {:?}",
+                    std::any::type_name::<T>(),
+                    key
+                );
+                return Err(TrackerError::NotFound(key));
+            };
+
+            if entry.generation != key.generation() {
+                std::hint::cold_path();
+                log::error!(
+                    "Failed to borrow {}: Generation mismatch for key {:?}",
+                    std::any::type_name::<T>(),
+                    key
+                );
+                return Err(TrackerError::NotFound(key));
+            }
+
+            let Some(val) = entry.value.as_ref() else {
+                std::hint::cold_path();
+                log::error!(
+                    "Failed to borrow {}: AlreadyBorrowedMutably for key {:?}",
+                    std::any::type_name::<T>(),
+                    key
+                );
+                return Err(TrackerError::AlreadyBorrowedMutably(key));
+            };
+
+            Arc::clone(val)
+        };
+
+        Ok(crate::TrackedRef::new(val))
     }
 
     fn borrow_mut(
@@ -144,7 +203,7 @@ impl<T> Tracker<T> for OpaqueTracker<T> {
                 );
                 return Err(TrackerError::NotFound(key));
             }
-            let Some(val) = entry.value.take() else {
+            let Some(mut val) = entry.value.take() else {
                 std::hint::cold_path();
                 log::error!(
                     "Failed to borrow_mut {}: AlreadyBorrowedMutably for key {:?}",
@@ -154,13 +213,24 @@ impl<T> Tracker<T> for OpaqueTracker<T> {
                 return Err(TrackerError::AlreadyBorrowedMutably(key));
             };
 
+            if Arc::get_mut(&mut val).is_none() {
+                entry.value = Some(val);
+                std::hint::cold_path();
+                log::error!(
+                    "Failed to borrow_mut {}: AlreadyBorrowedImmutably for key {:?}",
+                    std::any::type_name::<T>(),
+                    key
+                );
+                return Err(TrackerError::AlreadyBorrowedImmutably(key));
+            }
+
             val
         };
 
         Ok(crate::Tracked::new(self, key, val))
     }
 
-    fn return_mut(&self, key: Self::Key, val: Box<T>) {
+    fn return_mut(&self, key: Self::Key, val: Arc<T>) {
         let mut state_guard = self.state.lock().unwrap();
         let state = &mut *state_guard;
         let index = key.index();
@@ -248,5 +318,70 @@ mod tests {
             tracker.reclaim(handle).unwrap_err(),
             TrackerError::AlreadyBorrowedMutably(handle)
         );
+    }
+
+    #[gtest]
+    fn test_shared_borrow() {
+        let tracker: OpaqueTracker<usize> = OpaqueTracker::new();
+        let handle = tracker.register(Box::new(42)).unwrap();
+
+        {
+            let b1 = tracker.borrow(handle).unwrap();
+            let b2 = tracker.borrow(handle).unwrap();
+            assert_eq!(*b1, 42);
+            assert_eq!(*b2, 42);
+        }
+
+        let mut m = tracker.borrow_mut(handle).unwrap();
+        *m = 99;
+        drop(m);
+
+        let res = tracker.reclaim(handle).unwrap();
+        assert_eq!(*res, 99);
+    }
+
+    #[gtest]
+    fn test_borrow_mut_while_shared_borrowed() {
+        let tracker: OpaqueTracker<usize> = OpaqueTracker::new();
+        let handle = tracker.register(Box::new(1)).unwrap();
+
+        let _shared = tracker.borrow(handle).unwrap();
+        assert_eq!(
+            tracker.borrow_mut(handle).err().unwrap(),
+            TrackerError::AlreadyBorrowedImmutably(handle)
+        );
+    }
+
+    #[gtest]
+    fn test_borrow_while_mutably_borrowed() {
+        let tracker: OpaqueTracker<usize> = OpaqueTracker::new();
+        let handle = tracker.register(Box::new(1)).unwrap();
+
+        let _mutable = tracker.borrow_mut(handle).unwrap();
+        assert_eq!(
+            tracker.borrow(handle).err().unwrap(),
+            TrackerError::AlreadyBorrowedMutably(handle)
+        );
+    }
+
+    #[gtest]
+    fn test_reclaim_while_shared_borrowed() {
+        let tracker: OpaqueTracker<usize> = OpaqueTracker::new();
+        let handle = tracker.register(Box::new(1)).unwrap();
+
+        let _shared = tracker.borrow(handle).unwrap();
+        assert_eq!(
+            tracker.reclaim(handle).unwrap_err(),
+            TrackerError::AlreadyBorrowedImmutably(handle)
+        );
+    }
+
+    #[gtest]
+    fn test_borrow_stale_handle() {
+        let tracker: OpaqueTracker<usize> = OpaqueTracker::new();
+        let handle = tracker.register(Box::new(1)).unwrap();
+        let _ = tracker.reclaim(handle).unwrap();
+
+        assert_eq!(tracker.borrow(handle).err().unwrap(), TrackerError::NotFound(handle));
     }
 }

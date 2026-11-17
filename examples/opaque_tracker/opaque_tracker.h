@@ -21,6 +21,7 @@ typedef struct Counter Counter;
 
 Counter* new_counter(void);
 void free_counter(Counter* counter);
+uint64_t get_counter(const Counter* counter);
 uint64_t increase_counter(Counter* counter);
 
 #ifdef __cplusplus
