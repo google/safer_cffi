@@ -69,6 +69,7 @@ impl<T, S: TrackerStorage<T>> OpaqueTracker<T, S> {
             let idx = state.entries.len();
             if idx > Handle::<T>::MAX_INDEX {
                 std::hint::cold_path();
+                drop(state);
                 log::error!("Failed to register {}: CapacityExceeded", std::any::type_name::<T>());
                 return Err(TrackerError::CapacityExceeded);
             }
@@ -98,6 +99,7 @@ impl<T, S: TrackerStorage<T>> OpaqueTracker<T, S> {
 
         let Some(entry) = state.entries.get_mut(index) else {
             std::hint::cold_path();
+            drop(state);
             log::error!(
                 "Failed to reclaim {}: NotFound for key {:?}",
                 std::any::type_name::<T>(),
@@ -108,6 +110,7 @@ impl<T, S: TrackerStorage<T>> OpaqueTracker<T, S> {
 
         if entry.generation != key.generation() {
             std::hint::cold_path();
+            drop(state);
             log::error!(
                 "Failed to reclaim {}: Generation mismatch for key {:?}",
                 std::any::type_name::<T>(),
@@ -118,6 +121,7 @@ impl<T, S: TrackerStorage<T>> OpaqueTracker<T, S> {
 
         let Some(val) = entry.value.take() else {
             std::hint::cold_path();
+            drop(state);
             log::error!(
                 "Failed to reclaim {}: AlreadyBorrowedMutably for key {:?}",
                 std::any::type_name::<T>(),
@@ -157,6 +161,7 @@ impl<T, S: TrackerStorage<T>> OpaqueTracker<T, S> {
 
             let Some(entry) = state.entries.get(index) else {
                 std::hint::cold_path();
+                drop(state);
                 log::error!(
                     "Failed to borrow {}: NotFound for key {:?}",
                     std::any::type_name::<T>(),
@@ -167,6 +172,7 @@ impl<T, S: TrackerStorage<T>> OpaqueTracker<T, S> {
 
             if entry.generation != key.generation() {
                 std::hint::cold_path();
+                drop(state);
                 log::error!(
                     "Failed to borrow {}: Generation mismatch for key {:?}",
                     std::any::type_name::<T>(),
@@ -177,6 +183,7 @@ impl<T, S: TrackerStorage<T>> OpaqueTracker<T, S> {
 
             let Some(val) = entry.value.as_ref() else {
                 std::hint::cold_path();
+                drop(state);
                 log::error!(
                     "Failed to borrow {}: AlreadyBorrowedMutably for key {:?}",
                     std::any::type_name::<T>(),
@@ -211,6 +218,7 @@ impl<T, S: TrackerStorage<T>> OpaqueTracker<T, S> {
 
             let Some(entry) = state.entries.get_mut(index) else {
                 std::hint::cold_path();
+                drop(state_guard);
                 log::error!(
                     "Failed to borrow_mut {}: NotFound for key {:?}",
                     std::any::type_name::<T>(),
@@ -221,6 +229,7 @@ impl<T, S: TrackerStorage<T>> OpaqueTracker<T, S> {
 
             if entry.generation != key.generation() {
                 std::hint::cold_path();
+                drop(state_guard);
                 log::error!(
                     "Failed to borrow_mut {}: Generation mismatch for key {:?}",
                     std::any::type_name::<T>(),
@@ -230,6 +239,7 @@ impl<T, S: TrackerStorage<T>> OpaqueTracker<T, S> {
             }
             let Some(mut val) = entry.value.take() else {
                 std::hint::cold_path();
+                drop(state_guard);
                 log::error!(
                     "Failed to borrow_mut {}: AlreadyBorrowedMutably for key {:?}",
                     std::any::type_name::<T>(),
@@ -243,6 +253,7 @@ impl<T, S: TrackerStorage<T>> OpaqueTracker<T, S> {
             if TrackerStorage::get_mut(&mut val).is_none() {
                 entry.value = Some(val);
                 std::hint::cold_path();
+                drop(state_guard);
                 log::error!(
                     "Failed to borrow_mut {}: AlreadyBorrowedImmutably for key {:?}",
                     std::any::type_name::<T>(),
