@@ -27,8 +27,9 @@ remaining `unsafe` blocks are confined to struct accessors with a one-line
 invariant. Reach for it whenever a C API is being reimplemented in Rust.
 
 Working examples for every pattern live in the crate's `examples/` directory
-(`opaque_tracker`, `functions`, `c_buf_ptr`, `c_buf_ptr_with_capacity`,
-`custom_allocator`). Copy from them rather than from memory.
+(`opaque_tracker`, `shared_tracker`, `functions`, `c_buf_ptr`,
+`c_buf_ptr_with_capacity`, `custom_allocator`). Copy from them rather than from
+memory.
 
 ## Crate layout
 
@@ -167,11 +168,11 @@ Rules that follow from how the tracker works:
 *   **`borrow_mut` is exclusive, not a lock.** It moves the object out of the
     tracker; a second `borrow_mut` or a `reclaim` of the same handle while the
     guard is alive returns `AlreadyBorrowedMutably` instead of blocking. So:
-    drop the `Tracked` guard *before* invoking C callbacks or calling other
-    entry points that may touch the same handle (extract what you need first).
-    Inside one entry point, borrow once and pass `&mut *guard` to helpers
-    instead of re-borrowing the handle. Different handles never contend beyond a
-    short internal mutex.
+    drop the `TrackedRefMut` guard *before* invoking C callbacks or calling
+    other entry points that may touch the same handle (extract what you need
+    first). Inside one entry point, borrow once and pass `&mut *guard` to
+    helpers instead of re-borrowing the handle. Different handles never contend
+    beyond a short internal mutex.
 *   **One plain `static` tracker per Rust type.** `OpaqueTracker::new()` is
     `const`, so no `OnceLock`/`lazy_static` wrapper is needed. `register` fails
     with `CapacityExceeded` only after ~4 billion live objects.
@@ -190,6 +191,52 @@ Rules that follow from how the tracker works:
     the struct's fields, C may read them through the pointer, so the Rust side
     must expose a real `#[repr(C)]` object (`Option<&mut T>` /
     `Option<Box<T>>`). Using `Handle<T>` there fails the signatures test.
+
+### Shared borrows: read-only entry points on the same handle
+
+`borrow_mut` also fails when two *read-only* calls use the same handle at the
+same time: `const Foo*` functions that C calls from several threads, the same
+handle passed for two parameters (`foo_equal(a, a)`), or a getter that C calls
+from a callback of another read-only call. For such objects, let the tracker
+hold `Arc<Foo>` instead of the default `Box<Foo>`, and use `borrow` wherever
+`&Foo` is enough:
+
+```rust
+use std::sync::Arc;
+
+static TRACKER: OpaqueTracker<Counter, Arc<Counter>> = OpaqueTracker::new();
+
+#[unsafe(no_mangle)]
+pub extern "C" fn new_counter() -> Handle<Counter> {
+    TRACKER.register(Arc::new(Counter(0))).unwrap_or_else(|_| Handle::null())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn get_counter(h: Handle<Counter>) -> u64 {
+    let Ok(c) = TRACKER.borrow(h) else { return 0 }; // NotFound / AlreadyBorrowedMutably
+    c.0
+} // guard drops here and releases the shared borrow
+```
+
+*   **Keep `Box` (the default) unless an entry point needs shared borrows.**
+    With `Arc`, `borrow_mut` costs more and `Foo` must be `Sync`. `borrow` does
+    not exist on a `Box` tracker: the compiler reports "shared borrows need a
+    tracker that holds `Arc<Foo>`".
+*   **Don't add `unsafe impl Sync for Foo` to make the `static` compile.** The
+    compiler asks for `Sync` because `borrow` hands `&Foo` to several threads at
+    once. If `Foo` is not thread-safe (`Cell`, `RefCell`, raw pointers), keep
+    `Box`.
+*   **`borrow_mut` still needs exclusive access.** It returns
+    `AlreadyBorrowedImmutably` while a `TrackedRef` guard, or any other
+    `Arc<Foo>` or `Weak<Foo>` pointing to the object, is alive. Don't keep a
+    clone or `Weak` of the `Arc` that was registered if the object is ever
+    borrowed mutably.
+*   **`reclaim` returns the `Arc<Foo>` and succeeds while shared borrows are
+    alive.** The handle is invalid from then on, and the object is dropped once
+    the returned `Arc<Foo>` and the last shared borrow are gone. That means
+    `Foo::drop` may run *after* the C `free_*` call returns, on whichever thread
+    drops the last `TrackedRef` — keep this in mind if `Drop` touches C-owned
+    parent or allocator state.
 
 ## Parameters: let the signature do the null checks
 
@@ -572,7 +619,10 @@ Don't                                                                           
 `TRACKER.borrow_mut(h).unwrap()`                                                     | `let Ok(mut x) = TRACKER.borrow_mut(h) else { return ERR }`                           | Panics abort across `extern "C"`.
 `if h == Handle::null() { return ERR }` before `borrow_mut`/`reclaim`                | Just handle the `Err`                                                                 | A null handle never matches; the tracker already returns `NotFound`.
 `static T: OnceLock<OpaqueTracker<_>>` / `lazy_static!`                              | `static T: OpaqueTracker<_> = OpaqueTracker::new();`                                  | `new()` is `const`.
-Holding a `Tracked` guard while calling a C callback                                 | Copy out what the callback needs, drop the guard, then call                           | Re-entrant use of the same handle fails with `AlreadyBorrowedMutably`.
+Holding a `TrackedRefMut` guard while calling a C callback                           | Copy out what the callback needs, drop the guard, then call                           | Re-entrant use of the same handle fails with `AlreadyBorrowedMutably`.
+Holding a `TrackedRef` guard while calling a C callback that may mutate the object   | Copy out what the callback needs, drop the guard, then call                           | A re-entrant `borrow_mut` of the same handle fails with `AlreadyBorrowedImmutably`.
+`borrow_mut` for a `const Foo*` that other calls may use at the same time            | `OpaqueTracker<Foo, Arc<Foo>>`, `register(Arc::new(..))` and `borrow`                 | Concurrent or aliased read-only calls fail with `AlreadyBorrowedMutably`.
+`unsafe impl Sync for Foo {}` so that a `static` `Arc` tracker compiles              | Keep the default `Box` tracker unless `Foo` really is thread-safe                     | `borrow` hands `&Foo` to several threads at once; a wrong `Sync` is undefined behaviour.
 `Option<&mut MaybeUninit<T>>` + `p.write(v)` for an out-param without drop glue      | `Option<&mut T>` + `*p = v`, written where C writes it; never read it first           | `&mut T` to uninitialised memory is fine ([UCG#414](https://github.com/rust-lang/unsafe-code-guidelines/issues/414)); reading it as `T` is not, and `.write(0)` placeholders clobber `*p` on early errors.
 `p.cloned()` / `*p` on an input struct when C only reads a subset of its fields      | Borrow `&T` and construct a new `T` from only the fields C reads, defaulting the rest | Whole-struct copies load uninitialised fields; if a `bool` field is uninitialised, `Option<T>` / `Arg<Option<T>>` puts its niche discriminant there and branches on garbage.
 `*mut T` + `len` fields with ad-hoc `from_raw_parts` at each use site                | `OwnedCBufPtr`/`CBufPtr` + accessors holding the only `unsafe`                        | One invariant, one place to audit.

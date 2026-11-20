@@ -20,6 +20,18 @@
 //! header defines the fields of a struct, pass the struct itself instead, as `Option<&mut T>` or
 //! `Option<Box<T>>`.
 //!
+//! ## Shared Borrows
+//!
+//! By default, a tracker holds each object in a `Box<T>` and only hands out exclusive borrows
+//! ([`OpaqueTracker::borrow_mut`]): borrowing an object fails while another borrow of it is alive.
+//!
+//! To let read-only entry points use the same object at the same time, give the tracker `Arc<T>`
+//! as its storage type (`OpaqueTracker<T, Arc<T>>`), and borrow with
+//! [`OpaqueTracker::borrow`] wherever no mutable access is needed.
+//!
+//! Trackers do not hold `Arc<T>` by default: such a tracker can only be a `static` if `T` is
+//! `Sync`, and its exclusive borrows are slightly more expensive.
+//!
 //! ## C Slices and Vectors
 //!
 //! Many C structs contain `(*mut T, L)` field pairs representing dynamically-sized
@@ -72,6 +84,6 @@ pub use core::alloc::Allocator;
 pub use errors::{AllocError, TrackerError};
 pub use handle::Handle;
 pub use opaque::OpaqueTracker;
-pub use tracker::Tracked;
 #[allow(deprecated)]
 pub use tracker::Tracker;
+pub use tracker::{ArcTrackerStorage, TrackedRef, TrackedRefMut, TrackerStorage};

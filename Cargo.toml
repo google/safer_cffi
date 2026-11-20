@@ -11,7 +11,7 @@ name = "safer_cffi"
 description = "Building blocks for safer C/Rust interop."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/google/safer_cffi"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 # The `Allocator` API is stable since Rust 1.100.
 rust-version = "1.100"

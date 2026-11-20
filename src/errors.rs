@@ -6,10 +6,16 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+/// Errors returned by [`OpaqueTracker`](crate::OpaqueTracker).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrackerError<K> {
+    /// The key is null, unknown, or stale: the object it referred to was reclaimed.
     NotFound(K),
+    /// The object is shared: a `TrackedRef`, another `Arc`, or a `Weak` pointing to it is alive.
+    AlreadyBorrowedImmutably(K),
+    /// The object is borrowed mutably: a `TrackedRefMut` guard for it is alive.
     AlreadyBorrowedMutably(K),
+    /// The tracker cannot take the object: it has no handle index left.
     CapacityExceeded,
 }
 
@@ -17,6 +23,9 @@ impl<K: core::fmt::Debug> core::fmt::Display for TrackerError<K> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::NotFound(key) => write!(f, "Key {:?} not tracked", key),
+            Self::AlreadyBorrowedImmutably(key) => {
+                write!(f, "Key {:?} is already borrowed immutably", key)
+            }
             Self::AlreadyBorrowedMutably(key) => {
                 write!(f, "Key {:?} is already borrowed mutably", key)
             }

@@ -23,8 +23,12 @@ prevents concurrent mutable access. It provides:
 
 *   `register(Box<T>)` → `Handle<T>` — stores the object, returns a handle for
     C.
-*   `borrow_mut(handle)` → `Tracked<T>` — exclusive access via a RAII guard.
+*   `borrow_mut(handle)` → `TrackedRefMut<T>` — exclusive access via a RAII
+    guard.
 *   `reclaim(handle)` → `Box<T>` — takes back ownership, removing from tracker.
+
+It holds its objects in a `Box<T>` unless it is declared with `Arc<T>` as its
+second type parameter, which adds [shared borrows](#shared-borrows).
 
 The tracker uses generational `Handle<T>` IDs. It prevents use-after-free via
 generation checks and detects double-borrows.
@@ -48,6 +52,46 @@ See [`examples/opaque_tracker/`](examples/opaque_tracker/) for a full example.
 A handle is not an address, so C code cannot read the fields of a tracked
 object. If the header defines the fields of a struct, hand the struct itself to
 C instead, as `Option<Box<T>>` or `Option<&mut T>`.
+
+### Shared Borrows
+
+`borrow_mut` is exclusive: it fails while another borrow of the same object is
+alive. That is too strict for read-only functions that C may call for the same
+object from several threads, or with the same object for two parameters.
+
+A tracker that holds `Arc<T>` instead of `Box<T>` additionally provides:
+
+*   `borrow(handle)` → `TrackedRef<T>` — shared access via a RAII guard. Any
+    number of shared borrows of the same object can be alive at the same time.
+
+```rust
+static TRACKER: OpaqueTracker<MyObj, Arc<MyObj>> = OpaqueTracker::new();
+
+#[unsafe(no_mangle)]
+pub extern "C" fn create() -> Handle<MyObj> {
+    TRACKER.register(Arc::new(MyObj::default())).unwrap_or_else(|_| Handle::null())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn size(h: Handle<MyObj>) -> usize {
+    let Ok(obj) = TRACKER.borrow(h) else { return 0 };
+    obj.size()
+}
+```
+
+Trackers do not hold `Arc<T>` by default, because it comes with a few
+differences:
+
+*   `T` must be `Sync` for the tracker to be usable as a `static`.
+*   `register` takes an `Arc<T>`, and `reclaim` returns it.
+*   `borrow_mut` is slightly slower. It fails with `AlreadyBorrowedImmutably`
+    while a shared borrow or any other `Arc<T>` or `Weak<T>` pointing to the
+    object is alive.
+*   `reclaim` succeeds while shared borrows are alive: the handle is invalid
+    from then on, and the object is dropped once the returned `Arc<T>` and the
+    last shared borrow are gone.
+
+See [`examples/shared_tracker/`](examples/shared_tracker/) for a full example.
 
 ## Struct Field Helpers
 
