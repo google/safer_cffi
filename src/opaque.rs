@@ -8,12 +8,16 @@
 
 use crate::errors::TrackerError;
 use crate::handle::Handle;
-use crate::tracker::Tracker;
+use crate::tracker::Tracked;
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
-/// A tracker that manages objects using generational handles (`Handle<T>`).
+/// A tracker that manages the lifecycle of Rust objects across FFI boundaries.
+///
+/// The tracker stores Rust objects and identifies each of them by a generational handle
+/// (`Handle<T>`) that can be passed to C code. It ensures that objects are only accessed when
+/// valid, and prevents concurrent mutable access errors.
 pub struct OpaqueTracker<T> {
     state: Mutex<OpaqueTrackerState<T>>,
 }
@@ -45,10 +49,11 @@ impl<T> Default for OpaqueTracker<T> {
     }
 }
 
-impl<T> Tracker<T> for OpaqueTracker<T> {
-    type Key = Handle<T>;
-
-    fn register(&self, b: Box<T>) -> Result<Self::Key, TrackerError<Self::Key>> {
+impl<T> OpaqueTracker<T> {
+    /// Registers a new object with the tracker, taking ownership.
+    ///
+    /// Returns a `Handle` that can be passed to C.
+    pub fn register(&self, b: Box<T>) -> Result<Handle<T>, TrackerError<Handle<T>>> {
         let mut state = self.state.lock().unwrap();
         let index = if let Some(idx) = state.free_indices.pop_front() {
             idx
@@ -70,7 +75,11 @@ impl<T> Tracker<T> for OpaqueTracker<T> {
         Ok(handle)
     }
 
-    fn reclaim(&self, key: impl Into<Self::Key>) -> Result<Box<T>, TrackerError<Self::Key>> {
+    /// Reclaims ownership of the object from the tracker.
+    ///
+    /// This removes the object from the tracker and returns the `Box<T>`.
+    /// Fails if the object is currently borrowed.
+    pub fn reclaim(&self, key: impl Into<Handle<T>>) -> Result<Box<T>, TrackerError<Handle<T>>> {
         let key = key.into();
         let mut state = self.state.lock().unwrap();
         let index = key.index();
@@ -115,10 +124,16 @@ impl<T> Tracker<T> for OpaqueTracker<T> {
         Ok(val)
     }
 
-    fn borrow_mut(
+    /// Borrows the object, returning a guard that gives mutable access.
+    ///
+    /// Returns a `Tracked` guard that implements `DerefMut`. When the guard is dropped,
+    /// the object is automatically returned to the tracker.
+    ///
+    /// Fails if the object is currently borrowed.
+    pub fn borrow_mut(
         &self,
-        key: impl Into<Self::Key>,
-    ) -> Result<crate::Tracked<'_, T, Self>, TrackerError<Self::Key>> {
+        key: impl Into<Handle<T>>,
+    ) -> Result<Tracked<'_, T>, TrackerError<Handle<T>>> {
         let key = key.into();
         let val = {
             let mut state_guard = self.state.lock().unwrap();
@@ -157,10 +172,13 @@ impl<T> Tracker<T> for OpaqueTracker<T> {
             val
         };
 
-        Ok(crate::Tracked::new(self, key, val))
+        Ok(Tracked::new(self, key, val))
     }
 
-    fn return_mut(&self, key: Self::Key, val: Box<T>) {
+    /// Returns the borrowed object back to the tracker.
+    ///
+    /// Only the `Drop` implementation of the `Tracked` guard calls this.
+    pub(crate) fn return_mut(&self, key: Handle<T>, val: Box<T>) {
         let mut state_guard = self.state.lock().unwrap();
         let state = &mut *state_guard;
         let index = key.index();

@@ -8,27 +8,17 @@
 
 //! A library for creating safer C APIs from Rust.
 //!
-//! This crate provides trackers that manage the lifecycle of Rust objects, allowing
-//! them to be passed to C as handles or pointers and safely reclaimed later.
+//! This crate provides a tracker that manages the lifecycle of Rust objects, allowing
+//! them to be passed to C as opaque handles and safely reclaimed later.
 //!
-//! ## Choosing a Tracker
+//! ## Tracking Objects
 //!
-//! There are two tracker variants available:
+//! [`OpaqueTracker`] uses synthetic IDs to track objects ([`Handle<T>`]). Use it to provide opaque
+//! pointers to C code.
 //!
-//! - **Opaque Tracker** (`OpaqueTracker`): Uses synthetic IDs to track objects (`Handle<T>`). Use
-//!   this to provide opaque pointers to C code. This is faster and safer than the raw tracker.
-//!
-//! - **Raw Tracker** (`RawTracker`): Uses raw memory addresses (`*mut T`) as keys. Use this only if
-//!   you need to interoperate with existing C code that requires the actual pointer value, e.g. for
-//!   field access without helpers.
-//!
-//!   The raw tracker comes with two caveats:
-//!
-//!   - The raw tracker cannot be used if the API allows for objects to be created on the C side.
-//!     All objects must be created from the Rust side.
-//!   - It does not prevent ABA problems. That is, if an object is deallocated and a new object is
-//!     allocated in the same memory location, pointers to the old object will now silently point to
-//!     the new object.
+//! A handle is not an address, so C code cannot read the fields of a tracked object. If the C
+//! header defines the fields of a struct, pass the struct itself instead, as `Option<&mut T>` or
+//! `Option<Box<T>>`.
 //!
 //! ## C Slices and Vectors
 //!
@@ -67,7 +57,6 @@ pub(crate) mod c_vec;
 pub(crate) mod errors;
 pub(crate) mod handle;
 pub(crate) mod opaque;
-pub(crate) mod raw;
 #[cfg(test)]
 pub(crate) mod testing;
 pub(crate) mod tracker;
@@ -83,5 +72,6 @@ pub use core::alloc::Allocator;
 pub use errors::{AllocError, TrackerError};
 pub use handle::Handle;
 pub use opaque::OpaqueTracker;
-pub use raw::RawTracker;
-pub use tracker::{Tracked, Tracker};
+pub use tracker::Tracked;
+#[allow(deprecated)]
+pub use tracker::Tracker;

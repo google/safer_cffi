@@ -4,9 +4,9 @@
 Rust implementations while maintaining full ABI compatibility with the original
 C headers.
 
-*   **[Pointer Trackers](#pointer-trackers)** — Manage the lifecycle of Rust
-    objects handed to C as opaque handles or raw pointers, preventing
-    use-after-free and double-borrow bugs.
+*   **[Object Tracker](#object-tracker)** — Manages the lifecycle of Rust
+    objects handed to C as opaque handles, preventing use-after-free and
+    double-borrow bugs.
 
 *   **[Struct Field Helpers](#struct-field-helpers)** — Safe wrappers for common
     C struct field patterns (`*mut T`/`c_int` array pairs and `const char*`
@@ -15,22 +15,19 @@ C headers.
 **Tip:** Take a look at [`examples/`](examples/) for patterns and common use
 cases.
 
-## Pointer Trackers
+## Object Tracker
 
-Trackers manage the lifecycle of Rust objects that are handed to C code as
-opaque handles or pointers. They ensure objects are only accessed when valid and
-prevent concurrent mutable access.
+`OpaqueTracker<T>` manages the lifecycle of Rust objects that are handed to C
+code as opaque handles. It ensures objects are only accessed when valid and
+prevents concurrent mutable access. It provides:
 
-Both trackers implement the `Tracker<T>` trait, which provides:
+*   `register(Box<T>)` → `Handle<T>` — stores the object, returns a handle for
+    C.
+*   `borrow_mut(handle)` → `Tracked<T>` — exclusive access via a RAII guard.
+*   `reclaim(handle)` → `Box<T>` — takes back ownership, removing from tracker.
 
-*   `register(Box<T>)` → Key — stores the object, returns a key for C.
-*   `borrow_mut(key)` → `Tracked<T>` — exclusive access via a RAII guard.
-*   `reclaim(key)` → `Box<T>` — takes back ownership, removing from tracker.
-
-### `OpaqueTracker<T>` (recommended)
-
-Uses generational `Handle<T>` IDs. Prevents use-after-free via generation checks
-and detects double-borrows.
+The tracker uses generational `Handle<T>` IDs. It prevents use-after-free via
+generation checks and detects double-borrows.
 
 ```rust
 static TRACKER: safer_cffi::OpaqueTracker<MyObj> = safer_cffi::OpaqueTracker::new();
@@ -48,16 +45,9 @@ pub extern "C" fn destroy(h: Handle<MyObj>) {
 
 See [`examples/opaque_tracker/`](examples/opaque_tracker/) for a full example.
 
-### `RawTracker<T>`
-
-Uses raw memory addresses (`*mut T`) as keys. Use only when C code needs the
-actual pointer value (e.g. for direct field access). Caveats:
-
-*   Cannot be used if C creates objects — all objects must originate from Rust.
-*   Does not prevent ABA problems: a freed and re-allocated address silently
-    resolves to the new object.
-
-See [`examples/raw_tracker/`](examples/raw_tracker/) for a full example.
+A handle is not an address, so C code cannot read the fields of a tracked
+object. If the header defines the fields of a struct, hand the struct itself to
+C instead, as `Option<Box<T>>` or `Option<&mut T>`.
 
 ## Struct Field Helpers
 

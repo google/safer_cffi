@@ -27,9 +27,8 @@ remaining `unsafe` blocks are confined to struct accessors with a one-line
 invariant. Reach for it whenever a C API is being reimplemented in Rust.
 
 Working examples for every pattern live in the crate's `examples/` directory
-(`opaque_tracker`, `raw_tracker`, `functions`, `c_buf_ptr`,
-`c_buf_ptr_with_capacity`, `custom_allocator`). Copy from them rather than from
-memory.
+(`opaque_tracker`, `functions`, `c_buf_ptr`, `c_buf_ptr_with_capacity`,
+`custom_allocator`). Copy from them rather than from memory.
 
 ## Crate layout
 
@@ -136,7 +135,7 @@ ID, not an address, so use-after-free, double-free and double-borrow become
 `Err`s instead of memory corruption.
 
 ```rust
-use safer_cffi::{Handle, OpaqueTracker, Tracker}; // `Tracker` trait must be in scope
+use safer_cffi::{Handle, OpaqueTracker};
 
 pub struct Counter(u64);
 static TRACKER: OpaqueTracker<Counter> = OpaqueTracker::new();
@@ -191,15 +190,6 @@ Rules that follow from how the tracker works:
     the struct's fields, C may read them through the pointer, so the Rust side
     must expose a real `#[repr(C)]` object (`Option<&mut T>` /
     `Option<Box<T>>`). Using `Handle<T>` there fails the signatures test.
-
-### When to use `RawTracker` instead
-
-`RawTracker<T>` keys objects by their real address (`*mut T`), so C can read
-fields directly while Rust still rejects pointers it never handed out. Use it
-only when the header exposes the struct *and* C needs direct field access.
-Caveats: every object must be created by Rust (C-built structs are rejected),
-freed+reallocated addresses silently resolve to the new object (ABA), and it is
-measurably slower than `OpaqueTracker` (`benches/RESULTS.md`).
 
 ## Parameters: let the signature do the null checks
 
@@ -578,7 +568,7 @@ Don't                                                                           
 `Box::into_raw` / `Box::from_raw` for opaque objects                                 | `OpaqueTracker` + `Handle<T>`                                                         | `from_raw` on a stale or forged pointer is UB; the tracker returns `Err`.
 `&CStr`, `&str`, `String` in an `extern "C"` signature                               | `Option<CStrRef<'_>>` (input) / `clone_and_leak` of bytes (output)                    | Rust strings are fat pointers; not a `char*`.
 `Option<Box<T>>` for a pointer C may have `malloc`ed                                 | `Option<CBox<T>>`                                                                     | Allocator mismatch on drop.
-`Handle<T>` for a struct whose fields appear in the header                           | `#[repr(C)] T` with `Option<&mut T>` / `Option<Box<T>>` (or `RawTracker`)             | C code reads the fields through the pointer.
+`Handle<T>` for a struct whose fields appear in the header                           | `#[repr(C)] T` with `Option<&mut T>` / `Option<Box<T>>`                               | C code reads the fields through the pointer.
 `TRACKER.borrow_mut(h).unwrap()`                                                     | `let Ok(mut x) = TRACKER.borrow_mut(h) else { return ERR }`                           | Panics abort across `extern "C"`.
 `if h == Handle::null() { return ERR }` before `borrow_mut`/`reclaim`                | Just handle the `Err`                                                                 | A null handle never matches; the tracker already returns `NotFound`.
 `static T: OnceLock<OpaqueTracker<_>>` / `lazy_static!`                              | `static T: OpaqueTracker<_> = OpaqueTracker::new();`                                  | `new()` is `const`.
@@ -596,7 +586,6 @@ C-style names (`DGifGetLine`) or `#![allow(non_snake_case)]` in core modules    
 `impl Drop` of a `CBufPtr` struct placed after its accessors or other `impl` blocks  | `impl Drop` immediately after the struct definition                                   | Reviewers match each `CBufPtr` field to a `clear()` call; a missed one compiles fine and leaks.
 `unsafe { self.items.as_vec_mut(&mut self.item_len) }.clear()` in `Drop`             | `self.items_vec().clear()`, with `items_vec()` in the regular `impl` block            | `Drop` needs no `// SAFETY:` argument of its own and can't drift from the accessor.
 `OwnedCBufPtr::from_boxed_slice(std_vec.into_boxed_slice())`                         | Build a `CVec` (`Vec<T, LibcAlloc>`)                                                  | C frees the buffer with `free()`; it must come from `malloc`.
-`RawTracker` "because the API already passes pointers"                               | `OpaqueTracker` unless C dereferences the pointer                                     | Raw keys are slower and vulnerable to ABA reuse.
 Mismatched integer widths (`u32` for `int32_t`, `usize` for `int`)                   | Match the header exactly (`i32`, `c_int`)                                             | Links fine, corrupts data on the C side.
 Replacing or freeing a field while a parameter may point to it (`f(g, g->map)`)      | Raw pointer in wrapper; `Arg::Current` if it is that field, else `Arg::New(copy)`     | `take()` drops fields on early errors; a borrowed parameter may alias anything `g` owns, not just the replaced field.
 Returning an out-param in `Ok(..)`, or splitting the core function around it         | Pass it into the core as `&mut T` and write it where C does                           | C may store it before a later step fails; the core keeps C's control flow.

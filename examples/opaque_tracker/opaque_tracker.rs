@@ -6,8 +6,6 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use safer_cffi::Tracker;
-
 #[derive(Default)]
 pub struct Counter(u64);
 
