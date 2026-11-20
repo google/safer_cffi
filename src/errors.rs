@@ -8,32 +8,28 @@
 
 /// Errors returned by [`OpaqueTracker`](crate::OpaqueTracker).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TrackerError<K> {
-    /// The key is null, unknown, or stale: the object it referred to was reclaimed.
-    NotFound(K),
+pub enum TrackerError {
+    /// The handle is null, unknown, or stale: the object it referred to was reclaimed.
+    NotFound,
     /// The object is shared: a `TrackedRef`, another `Arc`, or a `Weak` pointing to it is alive.
-    AlreadyBorrowedImmutably(K),
+    AlreadyBorrowedImmutably,
     /// The object is borrowed mutably: a `TrackedRefMut` guard for it is alive.
-    AlreadyBorrowedMutably(K),
+    AlreadyBorrowedMutably,
     /// The tracker cannot take the object: it has no handle index left.
     CapacityExceeded,
 }
 
-impl<K: core::fmt::Debug> core::fmt::Display for TrackerError<K> {
+impl core::fmt::Display for TrackerError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::NotFound(key) => write!(f, "Key {:?} not tracked", key),
-            Self::AlreadyBorrowedImmutably(key) => {
-                write!(f, "Key {:?} is already borrowed immutably", key)
-            }
-            Self::AlreadyBorrowedMutably(key) => {
-                write!(f, "Key {:?} is already borrowed mutably", key)
-            }
+            Self::NotFound => write!(f, "Handle not tracked"),
+            Self::AlreadyBorrowedImmutably => write!(f, "Object is already borrowed immutably"),
+            Self::AlreadyBorrowedMutably => write!(f, "Object is already borrowed mutably"),
             Self::CapacityExceeded => write!(f, "Maximum tracker capacity reached"),
         }
     }
 }
 
-impl<K: core::fmt::Debug> std::error::Error for TrackerError<K> {}
+impl std::error::Error for TrackerError {}
 
 pub use core::alloc::AllocError;

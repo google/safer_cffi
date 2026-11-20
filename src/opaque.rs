@@ -61,7 +61,7 @@ impl<T, S: TrackerStorage<T>> OpaqueTracker<T, S> {
     /// Registers a new object with the tracker, taking ownership.
     ///
     /// Returns a `Handle` that can be passed to C.
-    pub fn register(&self, val: S) -> Result<Handle<T>, TrackerError<Handle<T>>> {
+    pub fn register(&self, val: S) -> Result<Handle<T>, TrackerError> {
         let mut state = self.state.lock().unwrap();
         let index = if let Some(idx) = state.free_indices.pop_front() {
             idx
@@ -92,7 +92,7 @@ impl<T, S: TrackerStorage<T>> OpaqueTracker<T, S> {
     /// If the tracker holds `Arc<T>`, shared borrows that are still alive do not make this fail:
     /// the handle becomes invalid right away, and the object is dropped once the returned `Arc<T>`
     /// and the last [`TrackedRef`] are gone.
-    pub fn reclaim(&self, key: impl Into<Handle<T>>) -> Result<S, TrackerError<Handle<T>>> {
+    pub fn reclaim(&self, key: impl Into<Handle<T>>) -> Result<S, TrackerError> {
         let key = key.into();
         let mut state = self.state.lock().unwrap();
         let index = key.index();
@@ -105,7 +105,7 @@ impl<T, S: TrackerStorage<T>> OpaqueTracker<T, S> {
                 std::any::type_name::<T>(),
                 key
             );
-            return Err(TrackerError::NotFound(key));
+            return Err(TrackerError::NotFound);
         };
 
         if entry.generation != key.generation() {
@@ -116,7 +116,7 @@ impl<T, S: TrackerStorage<T>> OpaqueTracker<T, S> {
                 std::any::type_name::<T>(),
                 key
             );
-            return Err(TrackerError::NotFound(key));
+            return Err(TrackerError::NotFound);
         }
 
         let Some(val) = entry.value.take() else {
@@ -127,7 +127,7 @@ impl<T, S: TrackerStorage<T>> OpaqueTracker<T, S> {
                 std::any::type_name::<T>(),
                 key
             );
-            return Err(TrackerError::AlreadyBorrowedMutably(key));
+            return Err(TrackerError::AlreadyBorrowedMutably);
         };
 
         if entry.generation < Handle::<T>::MAX_GENERATION {
@@ -147,10 +147,7 @@ impl<T, S: TrackerStorage<T>> OpaqueTracker<T, S> {
     /// borrow is released when the guard is dropped.
     ///
     /// Fails if the object is currently borrowed mutably.
-    pub fn borrow(
-        &self,
-        key: impl Into<Handle<T>>,
-    ) -> Result<TrackedRef<'_, T>, TrackerError<Handle<T>>>
+    pub fn borrow(&self, key: impl Into<Handle<T>>) -> Result<TrackedRef<'_, T>, TrackerError>
     where
         S: ArcTrackerStorage<T>,
     {
@@ -167,7 +164,7 @@ impl<T, S: TrackerStorage<T>> OpaqueTracker<T, S> {
                     std::any::type_name::<T>(),
                     key
                 );
-                return Err(TrackerError::NotFound(key));
+                return Err(TrackerError::NotFound);
             };
 
             if entry.generation != key.generation() {
@@ -178,7 +175,7 @@ impl<T, S: TrackerStorage<T>> OpaqueTracker<T, S> {
                     std::any::type_name::<T>(),
                     key
                 );
-                return Err(TrackerError::NotFound(key));
+                return Err(TrackerError::NotFound);
             }
 
             let Some(val) = entry.value.as_ref() else {
@@ -189,7 +186,7 @@ impl<T, S: TrackerStorage<T>> OpaqueTracker<T, S> {
                     std::any::type_name::<T>(),
                     key
                 );
-                return Err(TrackerError::AlreadyBorrowedMutably(key));
+                return Err(TrackerError::AlreadyBorrowedMutably);
             };
 
             ArcTrackerStorage::share(val)
@@ -209,7 +206,7 @@ impl<T, S: TrackerStorage<T>> OpaqueTracker<T, S> {
     pub fn borrow_mut(
         &self,
         key: impl Into<Handle<T>>,
-    ) -> Result<TrackedRefMut<'_, T, S>, TrackerError<Handle<T>>> {
+    ) -> Result<TrackedRefMut<'_, T, S>, TrackerError> {
         let key = key.into();
         let val = {
             let mut state_guard = self.state.lock().unwrap();
@@ -224,7 +221,7 @@ impl<T, S: TrackerStorage<T>> OpaqueTracker<T, S> {
                     std::any::type_name::<T>(),
                     key
                 );
-                return Err(TrackerError::NotFound(key));
+                return Err(TrackerError::NotFound);
             };
 
             if entry.generation != key.generation() {
@@ -235,7 +232,7 @@ impl<T, S: TrackerStorage<T>> OpaqueTracker<T, S> {
                     std::any::type_name::<T>(),
                     key
                 );
-                return Err(TrackerError::NotFound(key));
+                return Err(TrackerError::NotFound);
             }
             let Some(mut val) = entry.value.take() else {
                 std::hint::cold_path();
@@ -245,7 +242,7 @@ impl<T, S: TrackerStorage<T>> OpaqueTracker<T, S> {
                     std::any::type_name::<T>(),
                     key
                 );
-                return Err(TrackerError::AlreadyBorrowedMutably(key));
+                return Err(TrackerError::AlreadyBorrowedMutably);
             };
 
             // A `Box<T>` is never shared. An `Arc<T>` is shared while `TrackedRef` guards or other
@@ -259,7 +256,7 @@ impl<T, S: TrackerStorage<T>> OpaqueTracker<T, S> {
                     std::any::type_name::<T>(),
                     key
                 );
-                return Err(TrackerError::AlreadyBorrowedImmutably(key));
+                return Err(TrackerError::AlreadyBorrowedImmutably);
             }
 
             val
@@ -338,7 +335,7 @@ mod tests {
         let handle = tracker.register(Box::new(1)).unwrap();
         let _ = tracker.reclaim(handle).unwrap();
 
-        assert_eq!(tracker.borrow_mut(handle).err().unwrap(), TrackerError::NotFound(handle));
+        assert_eq!(tracker.borrow_mut(handle).err().unwrap(), TrackerError::NotFound);
     }
 
     #[gtest]
@@ -346,8 +343,8 @@ mod tests {
         let tracker: OpaqueTracker<usize> = OpaqueTracker::new();
         let null: Handle<usize> = Handle::null();
 
-        verify_that!(tracker.borrow_mut(null).err(), some(eq(TrackerError::NotFound(null))))?;
-        verify_that!(tracker.reclaim(null).err(), some(eq(TrackerError::NotFound(null))))
+        verify_that!(tracker.borrow_mut(null).err(), some(eq(TrackerError::NotFound)))?;
+        verify_that!(tracker.reclaim(null).err(), some(eq(TrackerError::NotFound)))
     }
 
     #[gtest]
@@ -361,8 +358,8 @@ mod tests {
 
         verify_that!(fresh.index(), eq(stale.index()))?;
         verify_that!(fresh.generation(), gt(stale.generation()))?;
-        verify_that!(tracker.borrow_mut(stale).err(), some(eq(TrackerError::NotFound(stale))))?;
-        verify_that!(tracker.reclaim(stale).err(), some(eq(TrackerError::NotFound(stale))))?;
+        verify_that!(tracker.borrow_mut(stale).err(), some(eq(TrackerError::NotFound)))?;
+        verify_that!(tracker.reclaim(stale).err(), some(eq(TrackerError::NotFound)))?;
         let value = *tracker.borrow_mut(fresh)?;
         verify_that!(value, eq(2))
     }
@@ -373,10 +370,7 @@ mod tests {
         let handle = tracker.register(Box::new(1)).unwrap();
 
         let _tracked = tracker.borrow_mut(handle).unwrap();
-        assert_eq!(
-            tracker.borrow_mut(handle).err().unwrap(),
-            TrackerError::AlreadyBorrowedMutably(handle)
-        );
+        assert_eq!(tracker.borrow_mut(handle).err().unwrap(), TrackerError::AlreadyBorrowedMutably);
     }
 
     #[gtest]
@@ -385,10 +379,7 @@ mod tests {
         let handle = tracker.register(Box::new(1)).unwrap();
 
         let _tracked = tracker.borrow_mut(handle).unwrap();
-        assert_eq!(
-            tracker.reclaim(handle).unwrap_err(),
-            TrackerError::AlreadyBorrowedMutably(handle)
-        );
+        assert_eq!(tracker.reclaim(handle).unwrap_err(), TrackerError::AlreadyBorrowedMutably);
     }
 
     #[gtest]
@@ -434,7 +425,7 @@ mod tests {
 
         let result = tracker.borrow_mut(handle);
 
-        verify_that!(result.err(), some(eq(TrackerError::AlreadyBorrowedImmutably(handle))))
+        verify_that!(result.err(), some(eq(TrackerError::AlreadyBorrowedImmutably)))
     }
 
     #[gtest]
@@ -445,7 +436,7 @@ mod tests {
 
         let result = tracker.borrow_mut(handle);
 
-        verify_that!(result.err(), some(eq(TrackerError::AlreadyBorrowedImmutably(handle))))?;
+        verify_that!(result.err(), some(eq(TrackerError::AlreadyBorrowedImmutably)))?;
         drop(object);
         verify_that!(tracker.borrow_mut(handle).err(), none())
     }
@@ -459,7 +450,7 @@ mod tests {
 
         let result = tracker.borrow_mut(handle);
 
-        verify_that!(result.err(), some(eq(TrackerError::AlreadyBorrowedImmutably(handle))))?;
+        verify_that!(result.err(), some(eq(TrackerError::AlreadyBorrowedImmutably)))?;
         drop(weak);
         verify_that!(tracker.borrow_mut(handle).err(), none())
     }
@@ -472,7 +463,7 @@ mod tests {
 
         let result = tracker.borrow(handle);
 
-        verify_that!(result.err(), some(eq(TrackerError::AlreadyBorrowedMutably(handle))))
+        verify_that!(result.err(), some(eq(TrackerError::AlreadyBorrowedMutably)))
     }
 
     #[gtest]
@@ -483,7 +474,7 @@ mod tests {
 
         let result = tracker.borrow(handle);
 
-        verify_that!(result.err(), some(eq(TrackerError::NotFound(handle))))
+        verify_that!(result.err(), some(eq(TrackerError::NotFound)))
     }
 
     #[gtest]
@@ -495,7 +486,7 @@ mod tests {
         let reclaimed = tracker.reclaim(handle)?;
 
         // The handle is invalid from now on, but the shared borrow can still be used.
-        verify_that!(tracker.borrow(handle).err(), some(eq(TrackerError::NotFound(handle))))?;
+        verify_that!(tracker.borrow(handle).err(), some(eq(TrackerError::NotFound)))?;
         verify_that!(*shared, eq(1))?;
         verify_that!(Arc::strong_count(&reclaimed), eq(2))?;
         drop(shared);
@@ -510,7 +501,7 @@ mod tests {
 
         let result = tracker.reclaim(handle);
 
-        verify_that!(result.err(), some(eq(TrackerError::AlreadyBorrowedMutably(handle))))
+        verify_that!(result.err(), some(eq(TrackerError::AlreadyBorrowedMutably)))
     }
 
     const READER_THREADS: usize = 2;
@@ -559,8 +550,8 @@ mod tests {
                         thread::yield_now();
                     }
                     // The writer has the counter.
-                    Err(TrackerError::AlreadyBorrowedMutably(_)) => {}
-                    Err(TrackerError::NotFound(_)) if reclaiming.load(Ordering::SeqCst) => break,
+                    Err(TrackerError::AlreadyBorrowedMutably) => {}
+                    Err(TrackerError::NotFound) if reclaiming.load(Ordering::SeqCst) => break,
                     Err(err) => report(format!("a reader got {err:?}")),
                 }
                 // Leave a gap between two borrows, so that the writer gets its turn.
@@ -581,8 +572,8 @@ mod tests {
                         thread::yield_now();
                     }
                     // A reader has the counter.
-                    Err(TrackerError::AlreadyBorrowedImmutably(_)) => {}
-                    Err(TrackerError::NotFound(_)) if reclaiming.load(Ordering::SeqCst) => break,
+                    Err(TrackerError::AlreadyBorrowedImmutably) => {}
+                    Err(TrackerError::NotFound) if reclaiming.load(Ordering::SeqCst) => break,
                     Err(err) => report(format!("the writer got {err:?}")),
                 }
                 // Leave a gap between two borrows, so that the readers get their turn.
@@ -602,7 +593,7 @@ mod tests {
             let reclaimed = loop {
                 match tracker.reclaim(handle) {
                     // The writer has the counter.
-                    Err(TrackerError::AlreadyBorrowedMutably(_)) => thread::yield_now(),
+                    Err(TrackerError::AlreadyBorrowedMutably) => thread::yield_now(),
                     result => break result,
                 }
             };
