@@ -68,7 +68,6 @@ pub(crate) mod c_str;
 pub(crate) mod c_vec;
 pub(crate) mod errors;
 pub(crate) mod handle;
-pub(crate) mod opaque;
 #[cfg(test)]
 pub(crate) mod testing;
 pub(crate) mod tracker;
@@ -83,7 +82,6 @@ pub use c_vec::CVecRefMut;
 pub use core::alloc::Allocator;
 pub use errors::{AllocError, TrackerError};
 pub use handle::Handle;
-pub use opaque::OpaqueTracker;
 #[allow(deprecated)]
 pub use tracker::Tracker;
-pub use tracker::{ArcTrackerStorage, TrackedRef, TrackedRefMut, TrackerStorage};
+pub use tracker::{ArcTrackerStorage, OpaqueTracker, TrackedRef, TrackedRefMut, TrackerStorage};
