@@ -11,7 +11,7 @@
 #![allow(dead_code)]
 #![allow(clippy::undocumented_unsafe_blocks)]
 
-use crate::alloc::LibcAlloc;
+use crate::alloc::{EquivalentAlloc, LibcAlloc};
 use crate::c_buf::{CBufLen, CBufPtr};
 use core::alloc::{AllocError, Allocator, Layout};
 use core::ptr::NonNull;
@@ -112,3 +112,7 @@ unsafe impl Allocator for &TrackingAlloc {
         unsafe { LibcAlloc.shrink(ptr, old_layout, new_layout) }
     }
 }
+
+// SAFETY: `TrackingAlloc::eq` checks pointer identity (`core::ptr::eq`), and every `TrackingAlloc`
+// delegates allocation and deallocation to `LibcAlloc`.
+unsafe impl EquivalentAlloc for &TrackingAlloc {}

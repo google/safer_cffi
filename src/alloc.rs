@@ -112,7 +112,8 @@ fn malloc_size(layout: Layout) -> Option<usize> {
 ///
 /// Beyond the [`Allocator`] contract, unsafe code may rely on the following. If `F` implements
 /// [`PartialEq`], two `CLikeAlloc<F>`s compare equal if their `F`s do, and equal allocators are
-/// equivalent (memory allocated through one may be deallocated through the other).
+/// equivalent (memory allocated through one may be deallocated through the other); accordingly,
+/// `CLikeAlloc<F>` implements [`EquivalentAlloc`].
 ///
 /// Every non-zero-sized block comes straight from its `F`'s `malloc`, `calloc`, or `realloc`, so
 /// C code may release it with the matching `free`. Conversely, a block that C allocated with these
@@ -176,8 +177,8 @@ impl<F: AllocFns> CLikeAlloc<F> {
 ///   size) and on success need only preserve the first `min(old_size, new_size)` bytes.
 /// - The methods need to be thread-safe only if the type is [`Send`] or [`Sync`].
 ///
-/// Copies (and, if the type implements [`PartialEq`], equal values) must accept each other's
-/// allocations.
+/// Copies (and, if the type implements [`PartialEq`], values that compare equal) must permanently
+/// accept each other's allocations, even after the originating value is dropped.
 ///
 /// # Example
 ///
@@ -620,6 +621,37 @@ impl DropByPtrAllocator for LibcAlloc {
         unsafe { LibcFns.free(ptr.as_ptr().cast::<c_void>()) };
     }
 }
+
+/// Marker trait for [`Allocator`]s whose [`PartialEq`] implementation guarantees allocator
+/// equivalence.
+///
+/// [`CVecRefMut::swap`](crate::CVecRefMut::swap) requires `A: EquivalentAlloc` so that swapping
+/// buffers between two handles is sound: safe `PartialEq` alone can return `true` for incompatible
+/// allocators (for example, two separate arenas), which would cause one allocator to grow or
+/// deallocate a block allocated by the other.
+///
+/// # Safety
+///
+/// Implementations must guarantee that once `a == b` returns `true`, `a` and `b` permanently
+/// remain equivalent [`Allocator`]s:
+/// - Any block currently allocated through `a` may be passed to `b`'s [`Allocator::deallocate`],
+///   [`Allocator::grow`], [`Allocator::grow_zeroed`], and [`Allocator::shrink`] (and vice versa),
+///   with the same effect as passing it to the originating allocator.
+/// - Shared or interior-mutable operations on `a` or `b` must not cause them to diverge while
+///   either allocator or any block allocated through either remains live.
+/// - Blocks allocated through `a` remain valid to use with `b` (and vice versa) even after the
+///   originating allocator value is dropped.
+pub unsafe trait EquivalentAlloc: Allocator + PartialEq {}
+
+// SAFETY: `CLikeAlloc::eq` compares `self.fns == other.fns`, and the `AllocFns` safety contract
+// guarantees that equal `AllocFns` values permanently accept each other's allocations even after
+// the originating value is dropped.
+unsafe impl<F: AllocFns + PartialEq> EquivalentAlloc for CLikeAlloc<F> {}
+
+// SAFETY: `<&A as Allocator>` delegates directly to `A`, and `<&A as PartialEq>` compares the
+// referenced `A` values. By `A: EquivalentAlloc`, once `a == b` returns `true`, `a` and `b`
+// permanently remain equivalent allocators even after either reference is dropped.
+unsafe impl<A: EquivalentAlloc + ?Sized> EquivalentAlloc for &A {}
 
 // Not derived, as the derived impl would call `F::clone`, which may do something other than copy
 // `fns`, while a clone of an allocator must behave like the original.

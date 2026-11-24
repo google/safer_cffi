@@ -14,7 +14,7 @@
 //! [`try_push_back`](CVecRefMut::try_push_back), [`clear`](CVecRefMut::clear), and
 //! [`swap`](CVecRefMut::swap).
 
-use crate::alloc::LibcAlloc;
+use crate::alloc::{EquivalentAlloc, LibcAlloc};
 use crate::c_buf::{max_slice_len, CBufLen, CBufPtr};
 use core::alloc::{Allocator, Layout};
 use core::ptr::{self, NonNull};
@@ -295,12 +295,12 @@ impl<'a, T, L: CBufLen, A: Allocator, C: CBufLen> CVecRefMut<'a, T, L, A, C> {
     }
 }
 
-impl<'a, T, L: CBufLen, A: Allocator + PartialEq, C: CBufLen> CVecRefMut<'a, T, L, A, C> {
+impl<'a, T, L: CBufLen, A: EquivalentAlloc, C: CBufLen> CVecRefMut<'a, T, L, A, C> {
     /// Swap the underlying pointer, len, and capacity with another handle that uses
-    /// the same allocator.
+    /// an equivalent allocator (as guaranteed by [`EquivalentAlloc`]).
     ///
     /// # Panics
-    /// Panics if `self` and `other` do not share the same allocator instance, or if
+    /// Panics if `self` and `other` do not compare equal under [`EquivalentAlloc`], or if
     /// exactly one of the two handles tracks capacity (both must track capacity, or
     /// neither).
     pub fn swap(&mut self, other: &mut CVecRefMut<'_, T, L, A, C>) {
@@ -637,6 +637,42 @@ mod tests {
             handle1.swap(&mut handle2);
         }));
         assert!(result.is_err());
+    }
+
+    #[gtest]
+    fn c_vec_ref_mut_swap_same_tracking_allocator() {
+        let alloc = TrackingAlloc::default();
+        let mut ptr1 = CBufPtr::<i32, _>::null();
+        let mut len1: c_int = 0;
+        let mut ptr2 = CBufPtr::<i32, _>::null();
+        let mut len2: c_int = 0;
+        {
+            let mut handle1 = unsafe { ptr1.as_vec_mut_in(&mut len1, &alloc) };
+            handle1.push_back(1);
+            let mut handle2 = unsafe { ptr2.as_vec_mut_in(&mut len2, &alloc) };
+            handle2.push_back(2);
+            handle2.push_back(3);
+
+            handle1.swap(&mut handle2);
+            assert_that!(&*handle1, container_eq([2, 3]));
+            assert_that!(&*handle2, container_eq([1]));
+
+            handle1.clear();
+            handle2.clear();
+        }
+        assert!(ptr1.is_null());
+        assert!(ptr2.is_null());
+        assert_that!(alloc.dealloc_count.load(Ordering::SeqCst), eq(2));
+    }
+
+    #[gtest]
+    fn equivalent_alloc_impls() {
+        fn assert_equiv<A: EquivalentAlloc>() {}
+
+        assert_equiv::<LibcAlloc>();
+        assert_equiv::<&LibcAlloc>();
+        assert_equiv::<crate::CLikeAlloc<crate::CustomFns>>();
+        assert_equiv::<&TrackingAlloc>();
     }
 
     #[gtest]

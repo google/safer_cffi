@@ -73,8 +73,8 @@ pub(crate) mod testing;
 pub(crate) mod tracker;
 
 pub use alloc::{
-    AllocFns, CBox, CLikeAlloc, CVec, CallocFn, CustomFns, DropByPtrAllocator, FreeFn, LibcAlloc,
-    LibcFns, MallocFn,
+    AllocFns, CBox, CLikeAlloc, CVec, CallocFn, CustomFns, DropByPtrAllocator, EquivalentAlloc,
+    FreeFn, LibcAlloc, LibcFns, MallocFn,
 };
 pub use c_buf::{CBufLen, CBufPtr, OwnedCBufPtr};
 pub use c_str::CStrRef;
