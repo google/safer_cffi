@@ -343,14 +343,15 @@ impl<T, A: Allocator> CBufPtr<T, A> {
     ///
     /// # Safety
     ///
-    /// - `len` is the number of initialized elements pointed to by `self.ptr` (or 0 if empty).
+    /// - If `self.ptr` is non-null and `*len > 0`, `self.ptr` points to an allocation of exactly
+    ///   `*len` initialized elements of `T` allocated with `Layout::array::<T>(*len)` by `alloc`.
     /// - The instance of `A` passed to this function MUST BE the same instance that was used for
     ///   allocation of `self`.
     ///
     /// # Panics
     ///
-    /// Panics if `*len` is negative, exceeds the maximum safe slice length, or if
-    /// `self.ptr` is null and `*len > 0`.
+    /// Panics if `*len` is negative, exceeds the maximum safe slice length, if `self.ptr` is null
+    /// and `*len > 0`, or if `self.ptr` is non-null and `*len == 0`.
     pub unsafe fn as_vec_mut_in<'a, L: CBufLen>(
         &'a mut self,
         len: &'a mut L,
@@ -367,6 +368,10 @@ impl<T, A: Allocator> CBufPtr<T, A> {
             !self.ptr.is_null() || slice_len == 0,
             "CBufPtr: null pointer with non-zero length {slice_len}"
         );
+        // ZSTs are not supported, so a non-null allocation always has non-zero length; rejecting
+        // non-null + zero length here ensures `try_push_back` and `clear` always know the exact
+        // non-zero `Layout::array::<T>(len)` to pass to `Allocator`.
+        assert!(self.ptr.is_null() || slice_len > 0, "CBufPtr: non-null pointer with zero length");
         // SAFETY: The caller guarantees the pointer/len/cap invariants and allocator compatibility.
         // `&mut self` ties the lifetime of the returned `CVecRefMut` to the exclusive borrow,
         // preventing aliasing through `self`.
@@ -382,16 +387,17 @@ impl<T, A: Allocator> CBufPtr<T, A> {
     ///
     /// # Safety
     ///
-    /// - `*cap` is the number of elements the allocation pointed to by `self.ptr` can hold (or 0 if
-    ///   `self.ptr` is null).
-    /// - `*len` is the number of initialized elements, and `*len <= *cap`.
+    /// - If `self.ptr` is non-null and `*cap > 0`, `self.ptr` points to an allocation of exactly
+    ///   `*cap` elements of `T` allocated with `Layout::array::<T>(*cap)` by `alloc`, with the
+    ///   first `*len` elements initialized.
     /// - The instance of `A` passed to this function MUST BE the same instance that was used for
     ///   allocation of `self`.
     ///
     /// # Panics
     ///
     /// Panics if `*len` or `*cap` is negative, if `*cap` exceeds the maximum safe slice
-    /// length, if `*len > *cap`, or if `self.ptr` is null and `*cap > 0`.
+    /// length, if `*len > *cap`, if `self.ptr` is null and `*cap > 0`, or if `self.ptr` is
+    /// non-null and `*cap == 0`.
     pub unsafe fn as_vec_mut_with_cap_in<'a, L: CBufLen, C: CBufLen>(
         &'a mut self,
         len: &'a mut L,
@@ -412,6 +418,13 @@ impl<T, A: Allocator> CBufPtr<T, A> {
         assert!(
             !self.ptr.is_null() || (slice_cap == 0 && slice_len == 0),
             "CBufPtr: null pointer with non-zero capacity {slice_cap}"
+        );
+        // ZSTs are not supported, so a non-null allocation always has non-zero capacity; rejecting
+        // non-null + zero capacity here ensures `try_push_back` and `clear` always know the exact
+        // non-zero `Layout::array::<T>(cap)` to pass to `Allocator`.
+        assert!(
+            self.ptr.is_null() || slice_cap > 0,
+            "CBufPtr: non-null pointer with zero capacity"
         );
         // SAFETY: The caller guarantees the pointer/len/cap invariants and allocator compatibility.
         // `&mut self` ties the lifetime of the returned `CVecRefMut` to the exclusive borrow,
@@ -526,11 +539,13 @@ impl<T> CBufPtr<T, LibcAlloc> {
     /// # Safety
     ///
     /// - This pointer is tracked with length only (no capacity).
-    /// - `len` is the number of initialized elements pointed to by `self.ptr` (or 0 if empty).
+    /// - If `self.ptr` is non-null and `*len > 0`, `self.ptr` points to an allocation of exactly
+    ///   `*len` initialized elements of `T` allocated with `LibcAlloc`.
     ///
     /// # Panics
     ///
-    /// Panics if `*len` is negative or exceeds the maximum safe slice length.
+    /// Panics if `*len` is negative, exceeds the maximum safe slice length, if `self.ptr` is null
+    /// and `*len > 0`, or if `self.ptr` is non-null and `*len == 0`.
     pub unsafe fn as_vec_mut<'a, L: CBufLen>(
         &'a mut self,
         len: &'a mut L,
@@ -551,14 +566,15 @@ impl<T> CBufPtr<T, LibcAlloc> {
     /// # Safety
     ///
     /// - This pointer is tracked with length and capacity.
-    /// - `*cap` is the number of elements the allocation pointed to by `self.ptr` can hold (or 0 if
-    ///   `self.ptr` is null).
-    /// - `*len` is the number of initialized elements, and `*len <= *cap`.
+    /// - If `self.ptr` is non-null and `*cap > 0`, `self.ptr` points to an allocation of exactly
+    ///   `*cap` elements of `T` allocated with `LibcAlloc`, with the first `*len` elements
+    ///   initialized.
     ///
     /// # Panics
     ///
     /// Panics if `*len` or `*cap` is negative, if `*cap` exceeds the maximum safe slice
-    /// length, or if `*len > *cap`.
+    /// length, if `*len > *cap`, if `self.ptr` is null and `*cap > 0`, or if `self.ptr` is
+    /// non-null and `*cap == 0`.
     pub unsafe fn as_vec_mut_with_cap<'a, L: CBufLen, C: CBufLen>(
         &'a mut self,
         len: &'a mut L,

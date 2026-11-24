@@ -386,8 +386,9 @@ impl IntArray {
 *   **Length types are checked at runtime.** Negative lengths panic ("CBufPtr:
     len is negative"), so validate C-supplied counts before storing them into
     the struct if C can pass garbage. `as_vec_mut` also panics on a null pointer
-    with a non-zero length. A struct in either state is already corrupt: let it
-    panic instead of patching the count (see [Panics](#panics)).
+    with a non-zero length, or a non-null pointer with a zero length (or zero
+    capacity for `as_vec_mut_with_cap`). A struct in either state is already
+    corrupt: let it panic instead of patching the count (see [Panics](#panics)).
 *   **`T** items, int* len` out-parameters** (C owns an array and asks Rust to
     append): take the slot directly as `Option<&mut CBufPtr<T>>`. The function
     must be `unsafe` because it trusts `*len` to match `*items`:

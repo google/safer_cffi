@@ -62,8 +62,9 @@ const fn min_non_zero_cap<T>() -> usize {
 /// # Safety Invariant
 ///
 /// - Let `cap` be the tracked capacity if present, or `len` otherwise. If `cap > 0`, `ptr` is
-///   non-null and points to an allocation of exactly `cap` elements of `T` (allocated by `A`), and
-///   `cap <= isize::MAX / size_of::<T>()`.
+///   non-null and points to an allocation of exactly `cap` elements of `T` (allocated by `A` with
+///   `Layout::array::<T>(cap)`), and `cap <= isize::MAX / size_of::<T>()`. If `cap == 0`, `ptr` is
+///   null.
 /// - `len` is the number of initialised, leading elements and satisfies `len <= cap`. If `len ==
 ///   0`, no element is initialised.
 /// - `alloc` is the allocator used for all allocations.
@@ -195,15 +196,24 @@ impl<'a, T, L: CBufLen, A: Allocator, C: CBufLen> CVecRefMut<'a, T, L, A, C> {
                 core::hint::cold_path();
                 return Err(value);
             };
-            let Ok(old_layout) = Layout::array::<T>(old_cap.unwrap_or(old_len).max(1)) else {
-                core::hint::cold_path();
-                return Err(value);
-            };
 
             let alloc_result = match NonNull::new(self.ptr.as_ptr() as *mut u8) {
-                // SAFETY: If `old_ptr` is non-null, it was allocated by `self.alloc` with
-                // `old_layout` (`old_cap` elements, or `old_len` when capacity is untracked).
-                Some(old_ptr) => unsafe { self.alloc.grow(old_ptr, old_layout, new_layout) },
+                Some(old_ptr) => {
+                    let old_count = old_cap.unwrap_or(old_len);
+                    assert!(old_count > 0, "CVecRefMut: non-null pointer with zero capacity");
+                    let Ok(old_layout) = Layout::array::<T>(old_count) else {
+                        core::hint::cold_path();
+                        return Err(value);
+                    };
+                    // SAFETY: `old_ptr` is non-null, so by `CVecRefMut`'s safety invariant
+                    // `old_count > 0` and `old_ptr` was allocated by `self.alloc` with
+                    // `old_layout` (`old_cap` elements, or `old_len` when capacity is untracked).
+                    // Because this branch runs only when `old_cap.is_none_or(|cap| cap ==
+                    // old_len)`, `old_count == old_len`, and every `new_cap` branch ensures
+                    // `new_cap >= new_len = old_len + 1 > old_count`, so
+                    // `new_layout.size() >= old_layout.size()`.
+                    unsafe { self.alloc.grow(old_ptr, old_layout, new_layout) }
+                }
                 None => self.alloc.allocate(new_layout),
             };
             let Ok(new_ptr) = alloc_result else {
@@ -253,6 +263,7 @@ impl<'a, T, L: CBufLen, A: Allocator, C: CBufLen> CVecRefMut<'a, T, L, A, C> {
         }
 
         if let Some(non_null) = NonNull::new(old_ptr.as_ptr() as *mut u8) {
+            assert!(cap > 0, "CVecRefMut: non-null pointer with zero capacity");
             // We use a local Drop guard to guarantee that deallocation is called
             // even if `ptr::drop_in_place` panics while dropping the elements.
             // This prevents leaking the underlying allocation.
@@ -269,7 +280,7 @@ impl<'a, T, L: CBufLen, A: Allocator, C: CBufLen> CVecRefMut<'a, T, L, A, C> {
             }
             // The allocation covers `cap` elements, so it must be freed with a
             // `cap`-sized layout (which equals `len` when capacity is not tracked).
-            let layout = Layout::array::<T>(cap.max(1)).expect("CVecRefMut: valid layout");
+            let layout = Layout::array::<T>(cap).expect("CVecRefMut: valid layout");
             let _guard = AllocDropGuard { alloc: &self.alloc, ptr: non_null, layout };
 
             if len > 0 {
@@ -349,31 +360,54 @@ mod tests {
     }
 
     #[gtest]
-    fn c_vec_ref_mut_nonnull_ptr_zero_len() {
-        // Simulate a C struct where a buffer was allocated but len is 0.
-        // clear() must still free the buffer.
-        let mut ptr = unsafe { CBufPtr::<i32>::from_raw(libc::malloc(16) as *mut i32) };
+    #[should_panic(expected = "CBufPtr: non-null pointer with zero length")]
+    fn c_vec_ref_mut_nonnull_ptr_zero_len_panics() {
+        let mut dummy = 0i32;
+        let mut ptr = unsafe { CBufPtr::from_raw(&mut dummy) };
         let mut len: c_int = 0;
-        let mut handle = unsafe { ptr.as_vec_mut(&mut len) };
-        assert_that!(handle.len(), eq(0));
-        assert!(handle.is_empty());
-        handle.clear();
-        assert!(ptr.is_null());
-        assert_that!(len, eq(0));
+        let _ = unsafe { ptr.as_vec_mut(&mut len) };
     }
 
     #[gtest]
-    fn c_vec_ref_mut_nonnull_ptr_zero_len_push_back() {
-        // Simulate a C struct where a buffer was allocated but len is 0.
-        // push_back() must free the previous buffer and grow properly.
-        let mut ptr = unsafe { CBufPtr::<i32>::from_raw(libc::malloc(16) as *mut i32) };
+    #[should_panic(expected = "CBufPtr: non-null pointer with zero capacity")]
+    fn c_vec_ref_mut_with_cap_nonnull_ptr_zero_cap_panics() {
+        let mut dummy = 0i32;
+        let mut ptr = unsafe { CBufPtr::from_raw(&mut dummy) };
         let mut len: c_int = 0;
-        let mut handle = unsafe { ptr.as_vec_mut(&mut len) };
-        handle.push_back(123);
-        assert_that!(&*handle, container_eq([123]));
-        handle.clear();
-        assert!(ptr.is_null());
-        assert_that!(len, eq(0));
+        let mut cap: c_int = 0;
+        let _ = unsafe { ptr.as_vec_mut_with_cap(&mut len, &mut cap) };
+    }
+
+    #[gtest]
+    fn c_vec_ref_mut_nonnull_small_alloc_zero_len_rejected_before_grow() {
+        // Previously, passing a non-null pointer with zero length to `as_vec_mut_in` was accepted
+        // and caused `try_push_back` to fabricate `Layout::array::<T>(1)`, triggering an OOB read
+        // in `AllocFns::realloc` when the buffer was smaller than `size_of::<T>()` (e.g.
+        // `malloc(1)` or `malloc(0)`). Construction must now reject it immediately.
+        let alloc = unsafe { crate::CLikeAlloc::new_with_malloc(libc::malloc, libc::free) };
+
+        let raw_small = unsafe { libc::malloc(1) } as *mut [u8; 64];
+        assert!(!raw_small.is_null());
+        let mut ptr = unsafe { CBufPtr::from_raw(raw_small) };
+        let mut len: usize = 0;
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut handle = unsafe { ptr.as_vec_mut_in(&mut len, alloc) };
+            handle.push_back([0u8; 64]);
+        }));
+        unsafe { libc::free(raw_small.cast()) };
+        assert!(res.is_err());
+
+        let raw_zero = unsafe { libc::malloc(0) } as *mut u64;
+        if !raw_zero.is_null() {
+            let mut ptr = unsafe { CBufPtr::from_raw(raw_zero) };
+            let mut len: usize = 0;
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut handle = unsafe { ptr.as_vec_mut_in(&mut len, alloc) };
+                handle.push_back(42);
+            }));
+            unsafe { libc::free(raw_zero.cast()) };
+            assert!(res.is_err());
+        }
     }
 
     #[gtest]
@@ -447,30 +481,91 @@ mod tests {
     }
 
     #[gtest]
-    fn c_vec_ref_mut_custom_allocator_push_back_to_nonnull_zero_len_grows() {
-        let alloc = TrackingAlloc::default();
-        // Allocate a dummy buffer first.
-        let slice = (&alloc).allocate(Layout::new::<i32>()).unwrap();
-        // SAFETY: ptr is valid and was just allocated, we don't modify it.
+    fn c_vec_ref_mut_with_cap_nonnull_zero_len_positive_cap_preserves_exact_layout() {
+        // A pre-allocated buffer with `len == 0` and `cap > 0` is valid when capacity is tracked,
+        // and both `grow` and `deallocate` must receive the exact `Layout::array::<T>(cap)`.
+        use core::alloc::{AllocError, Layout};
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+
+        #[derive(Default)]
+        struct StrictLayoutAlloc {
+            live: RefCell<HashMap<usize, Layout>>,
+        }
+
+        unsafe impl Allocator for &StrictLayoutAlloc {
+            fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+                let slice = LibcAlloc.allocate(layout)?;
+                let addr = slice.as_ptr().cast::<u8>().addr();
+                assert!(self.live.borrow_mut().insert(addr, layout).is_none());
+                Ok(slice)
+            }
+
+            unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+                let recorded = self
+                    .live
+                    .borrow_mut()
+                    .remove(&ptr.as_ptr().addr())
+                    .expect("deallocating unknown pointer");
+                assert_eq!(recorded, layout, "deallocate layout mismatch");
+                unsafe { LibcAlloc.deallocate(ptr, layout) };
+            }
+
+            unsafe fn grow(
+                &self,
+                ptr: NonNull<u8>,
+                old_layout: Layout,
+                new_layout: Layout,
+            ) -> Result<NonNull<[u8]>, AllocError> {
+                let recorded = self
+                    .live
+                    .borrow_mut()
+                    .remove(&ptr.as_ptr().addr())
+                    .expect("growing unknown pointer");
+                assert_eq!(recorded, old_layout, "grow old_layout mismatch");
+                let slice = unsafe { LibcAlloc.grow(ptr, old_layout, new_layout) }?;
+                let addr = slice.as_ptr().cast::<u8>().addr();
+                assert!(self.live.borrow_mut().insert(addr, new_layout).is_none());
+                Ok(slice)
+            }
+        }
+
+        let alloc = StrictLayoutAlloc::default();
+
+        // Case 1: clear() an empty buffer that has pre-allocated capacity 4.
+        let slice = (&alloc).allocate(Layout::array::<i32>(4).unwrap()).unwrap();
         let mut ptr = unsafe { CBufPtr::from_raw(slice.as_ptr() as *mut i32) };
-        let mut count: c_int = 0;
+        let mut len: c_int = 0;
+        let mut cap: c_int = 4;
         {
-            // SAFETY: ptr is non-null, count is 0, allocated via alloc.
-            let mut handle = unsafe { ptr.as_vec_mut_in(&mut count, &alloc) };
-            assert_that!(alloc.alloc_count.load(Ordering::SeqCst), eq(1));
-            assert_that!(alloc.grow_count.load(Ordering::SeqCst), eq(0));
-            assert_that!(alloc.dealloc_count.load(Ordering::SeqCst), eq(0));
-            handle.push_back(42);
-            // Must have grown the existing buffer via grow().
-            assert_that!(alloc.alloc_count.load(Ordering::SeqCst), eq(1));
-            assert_that!(alloc.grow_count.load(Ordering::SeqCst), eq(1));
-            assert_that!(alloc.dealloc_count.load(Ordering::SeqCst), eq(0));
-            assert_that!(&*handle, container_eq([42]));
+            let mut handle = unsafe { ptr.as_vec_mut_with_cap_in(&mut len, &mut cap, &alloc) };
+            assert!(handle.is_empty());
+            assert_that!(handle.capacity(), some(eq(4)));
             handle.clear();
-            assert_that!(alloc.dealloc_count.load(Ordering::SeqCst), eq(1));
         }
         assert!(ptr.is_null());
-        assert_that!(count, eq(0));
+        assert_that!(len, eq(0));
+        assert_that!(cap, eq(0));
+        assert!(alloc.live.borrow().is_empty());
+
+        // Case 2: push into pre-allocated spare capacity, grow past it, then clear.
+        let slice = (&alloc).allocate(Layout::array::<i32>(2).unwrap()).unwrap();
+        let mut ptr = unsafe { CBufPtr::from_raw(slice.as_ptr() as *mut i32) };
+        let mut len: c_int = 0;
+        let mut cap: c_int = 2;
+        {
+            let mut handle = unsafe { ptr.as_vec_mut_with_cap_in(&mut len, &mut cap, &alloc) };
+            handle.push_back(10);
+            handle.push_back(20);
+            handle.push_back(30); // grows from exact Layout::array::<i32>(2) to 4
+            assert_that!(&*handle, container_eq([10, 20, 30]));
+            assert_that!(handle.capacity(), some(eq(4)));
+            handle.clear();
+        }
+        assert!(ptr.is_null());
+        assert_that!(len, eq(0));
+        assert_that!(cap, eq(0));
+        assert!(alloc.live.borrow().is_empty());
     }
 
     #[gtest]
