@@ -244,7 +244,8 @@ pub unsafe trait AllocFns: Copy {
 
     /// Allocates `size` zero-initialized bytes, like C's `calloc(size, 1)`.
     ///
-    /// The default implementation calls [`malloc`](Self::malloc) and zeroes the allocation.
+    /// The default implementation returns null if `size > isize::MAX as usize`, otherwise calls
+    /// [`malloc`](Self::malloc) and zeroes the allocation.
     fn calloc(&self, size: usize) -> *mut c_void {
         default_calloc(self, size)
     }
@@ -253,18 +254,29 @@ pub unsafe trait AllocFns: Copy {
     ///
     /// Returns either null, leaving the block unchanged, or a pointer to a block of at least
     /// `new_size` bytes that holds the first `min(old_size, new_size)` bytes of the old one, which
-    /// it frees. The default implementation allocates a new block with [`malloc`](Self::malloc),
-    /// copies `min(old_size, new_size)` bytes, and frees the old block with [`free`](Self::free).
+    /// it frees. The default implementation returns null if `new_size > isize::MAX as usize`,
+    /// otherwise allocates a new block with [`malloc`](Self::malloc), copies
+    /// `min(old_size, new_size)` bytes, and frees the old block with [`free`](Self::free).
     ///
     /// # Safety
     ///
-    /// The caller must ensure that `ptr` may be passed to [`free`](Self::free) and points to at
-    /// least `old_size` bytes, and that `new_size > 0`.
+    /// The caller must ensure that `ptr` may be passed to [`free`](Self::free), is valid for reads
+    /// of `old_size` bytes (in particular, `old_size <= isize::MAX as usize`), and that
+    /// `new_size > 0`.
+    #[inline]
     unsafe fn realloc(&self, ptr: *mut c_void, old_size: usize, new_size: usize) -> *mut c_void {
+        // `ptr::copy_nonoverlapping` requires `new_ptr` to be valid for writes of
+        // `old_size.min(new_size)` bytes, and per `core::ptr#allocation` no Rust allocation may
+        // exceed `isize::MAX` bytes. C's `malloc` is not guaranteed to reject larger sizes.
+        if new_size > isize::MAX as usize {
+            return core::ptr::null_mut();
+        }
         let new_ptr = self.malloc(new_size);
         if !new_ptr.is_null() {
             // SAFETY: `ptr` is valid for reads of `old_size` bytes, and `new_ptr` is a fresh block,
-            // valid for writes of `new_size` bytes, so the two do not overlap.
+            // valid for writes of `new_size` bytes (with `new_size <= isize::MAX as usize` checked
+            // above), so the two do not overlap and `old_size.min(new_size) <= isize::MAX as
+            // usize`.
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     ptr.cast::<u8>(),
@@ -290,11 +302,19 @@ pub unsafe trait AllocFns: Copy {
 
 /// The default implementation of [`AllocFns::calloc`]: allocates `size` bytes with
 /// `fns.malloc` and zeroes them.
+#[inline]
 fn default_calloc(fns: &impl AllocFns, size: usize) -> *mut c_void {
+    // `ptr::write_bytes` requires `ptr` to be valid for writes of `size` bytes, which per
+    // `core::ptr#allocation` requires the range to lie within a single allocation of size
+    // `<= isize::MAX`. C's `malloc` is not guaranteed to reject sizes above `isize::MAX`.
+    if size > isize::MAX as usize {
+        return core::ptr::null_mut();
+    }
     let ptr = fns.malloc(size);
     if !ptr.is_null() {
         // SAFETY: By the `AllocFns` contract, a non-null result of `malloc(size)` is a fresh
-        // block, valid for writes of `size` bytes.
+        // block, valid for writes of `size` bytes, and `size <= isize::MAX as usize` is checked
+        // above.
         unsafe { ptr.cast::<u8>().write_bytes(0, size) };
     }
     ptr
@@ -409,11 +429,12 @@ impl<F: AllocFns> CLikeAlloc<F> {
 
         // SAFETY: By `malloc_size`'s safety-usable invariant, `size >= new_layout.size() > 0`. By
         // this function's contract `ptr` is currently allocated with a fitting `old_layout`, and
-        // `old_layout.size() != 0` here, so it may be passed to `free` and points to at least
-        // `old_layout.size()` bytes (see the `CLikeAlloc` docs). If the result is non-null it is
-        // valid for reads and writes of `size` bytes with the first `min(old_layout.size(), size)`
-        // bytes preserved, and by the same invariant aligned to `new_layout.align()`. If it is
-        // null, `ptr` is still allocated and unchanged.
+        // `old_layout.size() != 0` here, so it may be passed to `free` and is valid for reads of
+        // `old_layout.size()` bytes (with `old_layout.size() <= isize::MAX as usize` by `Layout`;
+        // see the `CLikeAlloc` docs). If the result is non-null it is valid for reads and writes
+        // of `size` bytes with the first `min(old_layout.size(), size)` bytes preserved, and by
+        // the same invariant aligned to `new_layout.align()`. If it is null, `ptr` is still
+        // allocated and unchanged.
         let new_ptr =
             unsafe { self.fns.realloc(ptr.as_ptr().cast::<c_void>(), old_layout.size(), size) };
         NonNull::new(new_ptr.cast::<u8>())
@@ -1498,5 +1519,44 @@ mod tests {
         drop(boxed);
         assert_that!(FREE_CALLS.get(), eq(1));
         assert_that!(LAST_CTX.get(), eq(opaque.addr()));
+    }
+
+    #[gtest]
+    fn default_calloc_rejects_size_above_isize_max() {
+        reset_calls();
+        let fns = CtxFns { ctx: 1 };
+        let ptr = fns.calloc((isize::MAX as usize) + 1);
+        assert!(ptr.is_null());
+        assert_that!(MALLOC_CALLS.get(), eq(0));
+
+        let custom = counting_malloc_alloc();
+        let ptr = custom.fns.calloc(usize::MAX);
+        assert!(ptr.is_null());
+        assert_that!(MALLOC_CALLS.get(), eq(0));
+    }
+
+    #[gtest]
+    fn default_realloc_rejects_size_above_isize_max() {
+        reset_calls();
+        let fns = CtxFns { ctx: 1 };
+        let ptr = fns.malloc(16);
+        assert!(!ptr.is_null());
+        assert_that!(MALLOC_CALLS.get(), eq(1));
+
+        // SAFETY: `ptr` was allocated with `fns.malloc(16)` and is still live.
+        let resized = unsafe { fns.realloc(ptr, 16, (isize::MAX as usize) + 1) };
+        assert!(resized.is_null());
+        assert_that!(MALLOC_CALLS.get(), eq(1));
+        assert_that!(FREE_CALLS.get(), eq(0));
+
+        // SAFETY: The failed `realloc` left `ptr` unchanged and still allocated.
+        let resized = unsafe { fns.realloc(ptr, 16, usize::MAX) };
+        assert!(resized.is_null());
+        assert_that!(MALLOC_CALLS.get(), eq(1));
+        assert_that!(FREE_CALLS.get(), eq(0));
+
+        // SAFETY: `ptr` is still allocated and unfreed.
+        unsafe { fns.free(ptr) };
+        assert_that!(FREE_CALLS.get(), eq(1));
     }
 }
