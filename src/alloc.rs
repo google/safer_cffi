@@ -599,7 +599,19 @@ impl CLikeAlloc<CustomFns> {
 /// because pointer wrappers like [`OwnedCBufPtr`](crate::OwnedCBufPtr) are `#[repr(transparent)]`
 /// around a single raw pointer and cannot store an allocator instance, so they must invoke
 /// deallocation statically during `Drop`.
-pub trait DropByPtrAllocator: Allocator {
+///
+/// # Safety
+///
+/// Implementations must guarantee that:
+/// - Any live, non-zero-sized block allocated through any instance of `Self` remains valid even
+///   after that allocator instance is dropped, until it is explicitly deallocated.
+/// - [`deallocate_by_ptr`](Self::deallocate_by_ptr) safely deallocates any live, non-zero-sized
+///   block allocated through any instance of `Self` without requiring the original [`Layout`].
+/// - If `Self: Send` or `Self: Sync`, [`deallocate_by_ptr`](Self::deallocate_by_ptr) is
+///   thread-safe: it is safe to call from any thread (even if the block was allocated on a
+///   different thread) and concurrently with other `deallocate_by_ptr` and [`Allocator`] calls on
+///   `Self`.
+pub unsafe trait DropByPtrAllocator: Allocator {
     /// Deallocates the memory referenced by `ptr`.
     ///
     /// # Safety
@@ -608,11 +620,16 @@ pub trait DropByPtrAllocator: Allocator {
     ///   size (`layout.size() > 0`).
     /// - No active references (`&T` or `&mut T`) or other aliases to the memory block exist, and
     ///   the memory referenced by `ptr` is not accessed after this call.
+    /// - If `Self` is neither [`Send`] nor [`Sync`], this must be called on the same thread that
+    ///   allocated `ptr`.
     unsafe fn deallocate_by_ptr(ptr: NonNull<u8>);
 }
 
-// The libc allocator supports freeing with only the pointer as an argument (`libc::free`).
-impl DropByPtrAllocator for LibcAlloc {
+// SAFETY: `LibcAlloc` delegates to C's `malloc`/`calloc`/`realloc`/`free`, which are global and
+// thread-safe: allocated blocks remain valid until freed regardless of `LibcAlloc` instance
+// lifetimes, and `libc::free` safely frees any live non-zero-sized block by pointer from any
+// thread, including concurrently with other allocator calls.
+unsafe impl DropByPtrAllocator for LibcAlloc {
     #[inline]
     unsafe fn deallocate_by_ptr(ptr: NonNull<u8>) {
         // SAFETY: By the `deallocate_by_ptr` contract, `ptr` is currently allocated by `LibcAlloc`

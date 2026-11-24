@@ -225,7 +225,7 @@ const fn const_min_u128(a: u128, b: u128) -> u128 {
 ///   initialized.
 /// - The pointer is always aligned for `T`.
 /// - If the pointer is non-null, it has been allocated with the allocator `A` with layout matching
-///   `Layout::array::<T>(len)`.
+///   `Layout::array::<T>(len)` (and on the current thread if `A` is neither [`Send`] nor [`Sync`]).
 #[repr(transparent)]
 pub struct CBufPtr<T, A = LibcAlloc> {
     ptr: *mut T,
@@ -614,8 +614,11 @@ impl<T> CBufPtr<T, LibcAlloc> {
     }
 }
 
-// SAFETY: `CBufPtr` is an owning pointer, so it is `Send` if `T` is `Send`.
-unsafe impl<T: Send, A> Send for CBufPtr<T, A> {}
+// SAFETY: `CBufPtr` logically owns the pointed-to array of `T`s allocated by `A`. Sending it to
+// another thread is sound when both `T: Send` (elements can move across threads) and `A: Send`
+// (allocations from `A` can be freed from another thread, including via `OwnedCBufPtr::drop` when
+// `A: DropByPtrAllocator`).
+unsafe impl<T: Send, A: Send> Send for CBufPtr<T, A> {}
 
 impl<T, A> fmt::Debug for CBufPtr<T, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -660,6 +663,9 @@ impl<T: Copy, A: DropByPtrAllocator> Drop for OwnedCBufPtr<T, A> {
         // - `OwnedCBufPtr` holds ownership of the allocation, and since we are in `Drop::drop(&mut
         //   self)`, no references or aliases to the memory exist or can be used after this call
         //   because self cannot be currently borrowed and cannot be used once drop returns.
+        // - If `A` is neither `Send` nor `Sync`, `OwnedCBufPtr<T, A>` is `!Send` (so `self` was
+        //   created on this thread and, by `CBufPtr`'s safety invariant, `ptr` was allocated on
+        //   this thread). Otherwise, `A::deallocate_by_ptr` is thread-safe.
         unsafe {
             A::deallocate_by_ptr(ptr);
         }
@@ -1067,7 +1073,9 @@ mod tests {
         }
     }
 
-    impl DropByPtrAllocator for GlobalTrackingAlloc {
+    // SAFETY: Delegates allocation and deallocation to `LibcAlloc` (global and thread-safe);
+    // counters live in thread-local storage.
+    unsafe impl DropByPtrAllocator for GlobalTrackingAlloc {
         unsafe fn deallocate_by_ptr(ptr: NonNull<u8>) {
             DEALLOC_COUNT.set(DEALLOC_COUNT.get() + 1);
             unsafe { LibcAlloc::deallocate_by_ptr(ptr) };
@@ -1224,5 +1232,62 @@ mod tests {
         check::<i16>();
         check::<i32>();
         check::<i64>();
+    }
+
+    #[gtest]
+    fn c_buf_ptr_send_requires_allocator_send() {
+        // `CBufPtr<T, A>` and `OwnedCBufPtr<T, A>` must only be `Send` when both `T: Send` and
+        // `A: Send`; otherwise an `OwnedCBufPtr` backed by a thread-local (`!Send`) allocator could
+        // be dropped on another thread.
+        struct NonSendAlloc(PhantomData<*mut ()>);
+
+        unsafe impl Allocator for NonSendAlloc {
+            fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+                LibcAlloc.allocate(layout)
+            }
+
+            unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+                unsafe { LibcAlloc.deallocate(ptr, layout) };
+            }
+        }
+
+        // SAFETY: `NonSendAlloc` is `!Send` (so cross-thread drop is prevented by the type system)
+        // and delegates to `LibcAlloc`.
+        unsafe impl DropByPtrAllocator for NonSendAlloc {
+            unsafe fn deallocate_by_ptr(ptr: NonNull<u8>) {
+                unsafe { LibcAlloc::deallocate_by_ptr(ptr) };
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct NonSendFns(PhantomData<*mut ()>);
+
+        // SAFETY: Delegates to `LibcFns`; `!Send` / `!Sync`.
+        unsafe impl crate::AllocFns for NonSendFns {
+            fn malloc(&self, size: usize) -> *mut core::ffi::c_void {
+                unsafe { libc::malloc(size) }
+            }
+
+            unsafe fn free(&self, ptr: *mut core::ffi::c_void) {
+                unsafe { libc::free(ptr) };
+            }
+        }
+
+        trait IsSend {
+            const IS_SEND: bool = false;
+        }
+        struct Check<T>(PhantomData<T>);
+        impl<T> IsSend for Check<T> {}
+        impl<T: Send> Check<T> {
+            const IS_SEND: bool = true;
+        }
+
+        assert_that!(Check::<CBufPtr<i32, LibcAlloc>>::IS_SEND, eq(true));
+        assert_that!(Check::<OwnedCBufPtr<i32, LibcAlloc>>::IS_SEND, eq(true));
+        assert_that!(Check::<CBufPtr<i32, NonSendAlloc>>::IS_SEND, eq(false));
+        assert_that!(Check::<OwnedCBufPtr<i32, NonSendAlloc>>::IS_SEND, eq(false));
+        assert_that!(Check::<CBufPtr<i32, crate::CLikeAlloc<NonSendFns>>>::IS_SEND, eq(false));
+        assert_that!(Check::<CBufPtr<*mut i32, LibcAlloc>>::IS_SEND, eq(false));
+        assert_that!(Check::<OwnedCBufPtr<*mut i32, LibcAlloc>>::IS_SEND, eq(false));
     }
 }
