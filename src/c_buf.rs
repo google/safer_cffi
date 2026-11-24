@@ -131,6 +131,7 @@ pub(crate) const fn max_slice_len<T>() -> usize {
 /// 5. **Maximum Value**: `Self::MAX` must be the maximum value representable by `Self` as a
 ///    non-negative `usize`, such that `Self::try_from(Self::MAX)` succeeds and round-trips. For any
 ///    `n: usize > Self::MAX`, `Self::try_from(n)` must return `Err`.
+/// 6. **Default Value**: `Self::default().try_into()` must return `Ok(0)`.
 pub unsafe trait CBufLen:
     Copy
     + TryInto<usize, Error: core::error::Error>
@@ -144,7 +145,8 @@ pub unsafe trait CBufLen:
 
 // SAFETY: Primitive unsigned integer types satisfy purity, determinism,
 // and round-trip conversion to/from `usize` within their representable ranges,
-// with `MAX` set to the maximum value representable as a `usize`.
+// with `Default::default()` equal to `0` and `MAX` set to the maximum value representable as a
+// `usize`.
 unsafe impl CBufLen for usize {
     const MAX: usize = usize::MAX;
 }
@@ -167,7 +169,8 @@ unsafe impl CBufLen for u64 {
 
 // SAFETY: Primitive signed integer types satisfy purity, determinism,
 // and correctly fail conversion via `TryInto<usize>` on negative values,
-// with `MAX` set to the maximum value representable as a `usize`.
+// with `Default::default()` equal to `0` and `MAX` set to the maximum value representable as a
+// `usize`.
 unsafe impl CBufLen for isize {
     const MAX: usize = isize::MAX as usize;
 }
@@ -1196,8 +1199,12 @@ mod tests {
     }
 
     #[gtest]
-    fn c_buf_len_max_roundtrips_and_overflow_fails() {
+    fn c_buf_len_default_and_max_roundtrip_and_overflow_fails() {
         fn check<T: CBufLen>() {
+            let default_val: usize =
+                T::default().try_into().expect("T::default().try_into() must succeed");
+            assert_that!(default_val, eq(0));
+
             let max = T::MAX;
             let val = T::try_from(max).expect("T::try_from(T::MAX) must succeed");
             let roundtrip: usize = val.try_into().expect("T.try_into() must succeed");
