@@ -4,7 +4,7 @@ description: >-
   Implements a C API in Rust with the safer_cffi crate while keeping the C ABI:
   crate structure (safe core vs. thin FFI layer, naming), opaque object handles
   (OpaqueTracker, Handle), nullable-pointer parameter idioms (Option-wrapped
-  references, boxes and CStrRef), pointer+length array fields in repr(C) structs
+  references, boxes and CStrRef), buffer pointers and pointer+length arrays
   (CBufPtr, OwnedCBufPtr, CVecRefMut), memory that C allocates or frees and
   custom allocation hooks (LibcAlloc, CLikeAlloc), and matching C behaviour
   (out-params on error paths, partially-initialised input structs, aliased
@@ -35,15 +35,19 @@ memory.
 
 Keep the algorithm in plain Rust and the C ABI in a thin layer around it:
 
-Module                                 | Contents                                                                                                                  | `unsafe`
-:------------------------------------- | :------------------------------------------------------------------------------------------------------------------------ | :-------
-`c_types.rs` (often bindgen-generated) | `#[repr(C)]` structs and constants from the header, plus their buffer accessors (see below)                               | Only inside the accessors, each with `// SAFETY:`
-`ffi.rs`                               | `#[unsafe(no_mangle)] pub extern "C" fn` wrappers: unpack arguments, call the core, map results to the C error convention | Ideally none; sometimes necessary for raw `(ptr, len)` parameters
-Core modules (`decoder.rs`, ...)       | The algorithm, written against slices, references and Rust types                                                          | None: `#![forbid(unsafe_code)]` at the top of each file
+Module                                 | Contents                                                                                    | `unsafe`
+:------------------------------------- | :------------------------------------------------------------------------------------------ | :-------
+`c_types.rs` (often bindgen-generated) | `#[repr(C)]` structs, C-facing state types, constants, and their buffer/allocator accessors | Only inside the accessors, each with `// SAFETY:`
+`allocate.rs` (optional)               | Custom `AllocFns` / `CLikeAlloc` allocator implementation and default C allocator callbacks | Only inside `AllocFns` impls and default callbacks, each with `// SAFETY:`
+`ffi.rs`                               | `#[unsafe(no_mangle)] pub extern "C" fn` wrappers: unpack arguments, call core, map errors  | Ideally none; sometimes needed for `(ptr, len)` parameters
+Core modules (`decoder.rs`, ...)       | The algorithm, written against slices, references and Rust types                            | None: `#![forbid(unsafe_code)]` at the top of each file
 
-*   **Size the FFI layer to the library.** For small and medium-sized libraries,
-    one `ffi.rs` plus an optional `c_types.rs` is enough. Larger libraries can
-    split `ffi.rs` into submodules (e.g. `ffi/decode.rs`, `ffi/encode.rs`).
+*   **Size the FFI layer to the library.** One `ffi.rs` plus an optional
+    `c_types.rs` (and `allocate.rs` when the library has custom C allocator
+    hooks) suffices for small/medium libraries; larger ones can split them into
+    submodules (e.g. `ffi/decode.rs`). Keep C-facing state types and their
+    `impl`s in `c_types.rs`, the custom allocator implementation in
+    `allocate.rs`, and `extern "C"` wrappers in `ffi.rs`.
 *   **Naming:** the core follows Rust conventions (`d_gif_open_file`,
     `snake_case` locals). Only the `extern "C"` wrappers, and the `#[repr(C)]`
     structs/fields, keep the exact C names (`DGifOpenFileName`). Put
@@ -51,13 +55,16 @@ Core modules (`decoder.rs`, ...)       | The algorithm, written against slices, 
     `#![allow(nonstandard_style)]` on the C types module (C type names like
     `z_stream` also trip `non_camel_case_types`), never on the crate root or the
     core.
-*   **Wrappers stay thin.** No algorithm logic in the FFI layer: if a wrapper
-    grows beyond argument unpacking and error mapping, move the logic into the
-    core where `forbid(unsafe_code)` applies. Do not create internal helpers in
-    the FFI layer. Move them into the core.
-*   When an `unsafe extern "C" fn` must accept raw `(ptr, len)` parameters,
-    convert `(ptr, len)` to `&[T]` / `&mut [T]` once at the top of the
-    `extern "C"` entry point.
+*   **Wrappers stay thin.** No algorithm logic in the FFI layer: move logic into
+    the core where `forbid(unsafe_code)` applies. Don't create internal FFI
+    helpers — inline single-use `safer_cffi` calls (e.g.
+    `try_clone_and_leak_in`) at their call site.
+*   At the top of `extern "C"` entry points in `ffi.rs`, convert `(ptr, len)`
+    pairs via `CBufPtr` (`with_len`/`with_len_mut`) and initialise uninitialised
+    owned fields with `safer_cffi::overwrite_without_drop(&mut s.state, None)`
+    in `init` functions rather than passing unvalidated structs further down the
+    call stack — code outside `ffi.rs` shouldn't have to care about
+    partially-uninitialised fields at all.
 *   **Never decay `&mut Context` to raw pointers (`*mut Context`, `*mut State`)
     to work around the borrow checker across C callbacks.**
 *   **Never hide `unsafe` behind "safe" helper functions.** Do not centralise
@@ -110,13 +117,15 @@ Opaque `typedef struct Foo Foo; Foo*`   | `Handle<Foo>`                         
 `const T*` parameter                    | `Option<&T>`                                    | `None` is NULL. Also `Option<&[T; N]>` for fixed-size arrays. Not if the call frees or moves what it may point to, see [Aliased arguments](#aliased-arguments).
 `T*` parameter, caller keeps ownership  | `Option<&mut T>`                                | Also `Option<&mut [T; N]>`.
 `T*` out-parameter, possibly uninit     | `Option<&mut T>`                                | `*p = v`; never read before writing. If `T` has drop glue, use `Option<&mut MaybeUninit<T>>` + `p.write(v)`. Write it on the same paths as C, see [Out-parameters](#out-parameters-and-error-paths).
-`T*` whose ownership moves to Rust      | `Option<Box<T>>` / `Option<CBox<T>>`            | `Box` if *Rust* allocated it with `Box`; `CBox` if allocated with `malloc`/`CBox`.
-`const char*` parameter                 | `Option<CStrRef<'_>>`                           | `.to_c_str()` / `.to_bytes()`. Never `&CStr` or `&str` (fat pointers, wrong ABI).
+`T*` whose ownership moves to Rust      | `Option<Box<T>>` / `Option<CBox<T>>`            | `Box` if *Rust* allocated it; `CBox` if `malloc`/`CBox`.
+`void*` / `T*` buffer freed by Rust     | `OwnedCBufPtr<u8>` / `OwnedCBufPtr<T>`          | `free`-like entry points (`drop(p)`); safe, null is a no-op.
+`(const) T* ptr, size_t len` parameters | `CBufPtr<T>` (`CBufPtr<u8>` for `void*`)        | `unsafe { ptr.with_len(len) }` / `.with_len_mut(len)` (check `is_null()` first if null ≠ empty).
+`const char*` param or borrowed return  | `Option<CStrRef<'_>>`                           | In: `.to_c_str()`/`.to_bytes()`. Out: `CStrRef::from_c_str(c"...")` (`'static`/`'a`). Never `&CStr`/`&str`.
 `T* items; int len;` struct fields      | `OwnedCBufPtr<T>` (`T: Copy`) or `CBufPtr<T>`   | Plus the original `len` field, see below. Never use `CBufPtr<T>` for a single object.
 `T** items, int* len` parameters        | `Option<&mut CBufPtr<T>>`, `Option<&mut c_int>` | C-owned array Rust appends to, see below.
 `T*` field pointing at one Rust object  | `Option<Box<T>>` / `Option<CBox<T>>`            | Dropped automatically with the parent struct.
-`T*` returned to C that C will `free()` | `Option<CBox<T>>` / `OwnedCBufPtr<T>`           |
-`T*` / `const T*` returned (borrowed)   | `Option<&'a mut T>` / `Option<&'a T>`           | Never return `*mut T` or `*const T`, always encode ownership assumptions.
+`T*` / `void*` returned for C to `free` | `Option<CBox<T>>` / `(Owned)CBufPtr<T>`         | `CBox` (1 object); `OwnedCBufPtr<T>` (`<u8>` for `void*`, `LibcAlloc`); `CBufPtr<T, A>` (custom alloc / `!Copy`).
+`T*` / `const T*` returned (borrowed)   | `Option<&'a (mut) T>` / `CBufPtr<T>`            | Single object: `Option<&'a (mut) T>`; buffer: `CBufPtr<T>`. Never return `*mut T` or `*const T`.
 
 *   **Never define raw-pointer `type` aliases (`pub type foo_ptr = *mut Foo`).**
     Keeping `*mut` in the Rust `type` alias hides a raw pointer and forces
@@ -125,9 +134,10 @@ Opaque `typedef struct Foo Foo; Foo*`   | `Handle<Foo>`                         
 *   **Never return raw pointers (`-> *mut T` or `-> *const T`).** Every return
     type must express its ownership or borrow: `-> Handle<Foo>`,
     `-> Option<Box<T>>`, `-> Option<CBox<T>>`, `-> OwnedCBufPtr<T>`,
-    `-> Option<&'a mut T>` / `-> Option<&'a T>`. Use exact-width primitive types
-    that match the header (`i32` for `int32_t`, `core::ffi::c_int` for `int`); a
-    `u32` vs `int32_t` mismatch is an ABI bug even though it links.
+    `-> CBufPtr<T, A>`, `-> Option<CStrRef<'a>>`, `-> Option<&'a mut T>` /
+    `-> Option<&'a T>`. Use exact-width primitive types that match the header
+    (`i32` for `int32_t`, `core::ffi::c_int` for `int`); a `u32` vs `int32_t`
+    mismatch is an ABI bug even though it links.
 
 ## Opaque objects: `OpaqueTracker` + `Handle`
 
@@ -178,15 +188,17 @@ Rules that follow from how the tracker works:
     with `CapacityExceeded` only after ~4 billion live objects.
 *   **No explicit null check.** `Handle::null()` never matches a live entry, so
     `borrow_mut`/`reclaim` already return `Err(NotFound)` for it.
-*   **Pointer fields in C structs that Rust owns** (e.g. `struct foo_state*
-    state`) don't need a tracker: make the field `Option<Box<State>>`.
-*   **Structs that C partially initialises** (zlib's `z_stream`: the caller sets
-    `zalloc`, `next_in`, ... and leaves `state` as garbage) do need a tracker,
-    because reading or dropping a garbage `Option<Box<_>>` is UB. Make such
-    fields `Handle<State>` (`#[repr(transparent)]` over `usize`, so any bit
-    pattern is valid): assign the result of `register` on init and
-    `borrow_mut(strm.state)` afterwards. Garbage and stale values come back as
-    `Err`. The same applies if C may copy the struct by value.
+*   **Pointer fields in C structs that Rust owns** (e.g.
+    `struct foo_state* state`) don't need a tracker: make the field
+    `Option<Box<State>>` or `Option<CBox<State>>` (both pointer-sized).
+*   **Structs that C partially initialises** (e.g. `z_stream`, leaving `state`
+    as garbage before `init`): reading/dropping a garbage `Option<Box<_>>` is
+    UB. Use `Handle<State>` (`usize`-backed, so garbage, stale, and value-copied
+    handles return `Err` — required if C may copy the struct by value), or use
+    `Option<Box/CBox<State>>` and call
+    `overwrite_without_drop(&mut strm.state, None)` at each `init` entry point
+    (see
+    [Partially-initialised input structs](#partially-initialised-input-structs)).
 *   **`Handle<T>` is only for types C cannot see into.** If the header defines
     the struct's fields, C may read them through the pointer, so the Rust side
     must expose a real `#[repr(C)]` object (`Option<&mut T>` /
@@ -253,6 +265,12 @@ pub extern "C" fn write_value(out: Option<&mut i32>, value: i32) {
 pub extern "C" fn take_ownership(obj: Option<Box<MyObj>>) { drop(obj); }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn free_buf(p: OwnedCBufPtr<u8>) { drop(p); } // null is a no-op
+
+#[unsafe(no_mangle)]
+pub extern "C" fn version() -> Option<CStrRef<'static>> { Some(CStrRef::from_c_str(c"1.0")) }
+
+#[unsafe(no_mangle)]
 pub extern "C" fn set_name(name: Option<CStrRef<'_>>) -> i32 {
     let Some(name) = name else { return -1 };
     let name = name.to_c_str().to_string_lossy(); // borrow is tied to the call
@@ -265,11 +283,11 @@ whenever every parameter is one of the safe spellings above and none depends on
 another. Make it `unsafe extern "C" fn` with a `# Safety` section when soundness
 rests on the caller:
 
-*   `(ptr, len)` *parameter* pairs that the table cannot express. Do the single
-    `unsafe` conversion at the top with a `// SAFETY:` comment naming the C
-    contract, and pass slices/references to safe code. Such a pair can also be
-    viewed through `CBufPtr`: `unsafe { CBufPtr::from_raw(p) }` then
-    `.with_len(len)`.
+*   `(ptr, len)` *parameter* pairs: take `ptr: CBufPtr<T>` (`CBufPtr<u8>` for
+    `void*`) directly instead of raw pointers, check `ptr.is_null()` if C
+    distinguishes null from empty, convert once with
+    `unsafe { ptr.with_len(len) }` / `.with_len_mut(len)` with a `// SAFETY:`
+    comment, and pass the slice to safe code.
 *   Parameters that are only valid together, such as an array slot and its count
     (`Option<&mut CBufPtr<T>>` + `Option<&mut c_int>`, see below). Each spelling
     is safe on its own, but a safe Rust caller could pass a count that doesn't
@@ -277,9 +295,10 @@ rests on the caller:
 *   Pointers that the call itself may invalidate, see
     [Aliased arguments](#aliased-arguments).
 
-Struct accessors (below) stay safe: they rely on the struct's documented field
-invariant instead. Free helpers taking raw pointers or lengths have no such
-invariant and must be `unsafe fn` (or inlined at the call site).
+Struct accessors — both buffer accessors (below) and `.allocator(&self)`
+accessors (under `CLikeAlloc`) — stay safe: they rely on the struct's documented
+field invariant instead. Free helpers taking raw pointers or lengths have no
+such invariant and must be `unsafe fn` (or inlined at the call site).
 
 ## Struct fields: `(T* items, int len)` pairs
 
@@ -450,11 +469,23 @@ image.RasterBits = OwnedCBufPtr::from_boxed_slice(raster.into_boxed_slice());
     `.collect()` and `Box::new` allocate with the global allocator: build a
     `CVec` instead, or copy with `OwnedCBufPtr::clone_from_slice` /
     `CBufPtr::clone_and_leak`.
-*   **Allocate large state zeroed, in place.** Rust has no placement `new`:
-    `CBox::new_in(State::new(), alloc)` builds the value on the stack first
-    (debug builds always do), which can overflow C threads' stacks for state of
-    hundreds of KB. If this is a concern, derive `zerocopy::FromZeros`, which
-    checks every field at compile time.
+*   **Keep `alloc`, `realloc`, and `free` symmetric on `LibcAlloc`.** Don't mix
+    `LibcAlloc.allocate` with raw `libc::free`/`realloc`: use `LibcAlloc`
+    (`allocate`, `deallocate_by_ptr` / `OwnedCBufPtr<u8>`, `grow`/`shrink`, or
+    `LibcFns`) across all three.
+*   **Allocate huge state (hundreds of KB / 1 MB+) zeroed in place with
+    `zerocopy::FromZeros`.** `Box::new`/`CBox::new_in` are fine for normal-sized
+    structs, but build values on the stack first and can overflow C threads'
+    stacks for huge state. Don't write
+    `unsafe { Box::<State>::new_zeroed().assume_init() }` or
+    `unsafe fn try_box_zeroed_in`: derive `zerocopy::FromZeros` and call
+    `State::new_box_zeroed()` (or `State::new_box_zeroed_in(alloc)` once your
+    `zerocopy` version includes it) — zero `unsafe`.
+*   **Don't hand-roll generic `unsafe` box helpers (e.g. `try_box_in`).**
+    Because `Box::try_new_in` is unstable, use `CBox::new_in` for fixed-size
+    structs or upstream the helper to `safer_cffi` (with tests and Miri). Keep
+    `try_*` APIs (`try_reserve_exact`, `try_clone_and_leak_in`, `try_push_back`)
+    for C-controlled sizes.
 *   **`Option<CBox<T>>` is pointer-sized** because `LibcAlloc` is zero-sized, so
     it can replace a `T*` field in a `#[repr(C)]` struct.
 
@@ -476,13 +507,30 @@ let alloc = unsafe { CLikeAlloc::new_with_malloc(hooks.malloc_fn, hooks.free_fn)
 let item = CBox::new_in(Item::default(), alloc);
 ```
 
-See the custom_allocator example for more details, including how to use
-`CLikeAlloc` with a context pointer.
+For structs carrying custom hooks (e.g. `zalloc`/`zfree` + `opaque`), expose a
+**safe** `fn allocator(&self) -> MyAlloc` backed by the struct's field
+invariant, defaulting null hooks with `.unwrap_or(default_fn)` (write defaults
+into null fields once in `init` if C requires it):
+
+```rust
+impl MyStream {
+    pub(crate) fn allocator(&self) -> MyAlloc {
+        // SAFETY: `MyStream`'s field invariant guarantees hooks satisfy `MyHooks`.
+        CLikeAlloc::new(unsafe {
+            MyHooks::new(self.zalloc.unwrap_or(def_alloc), self.zfree.unwrap_or(def_free), self.opaque)
+        })
+    }
+}
+```
+
+See `examples/custom_allocator/` (`custom_allocator.rs`, `with_context.rs`).
 
 ## Matching C behaviour
 
 The signatures test checks types, not behaviour. Ports drift from C in the
-places below even when every type is right.
+places below even when every type is right. Document intentional divergences
+(e.g. unsupported compile-time `MALLOC`/`FREE` macros) under `# Differentials`
+in `README.md` and note them in affected FFI doc comments.
 
 ### Out-parameters and error paths
 
@@ -553,6 +601,13 @@ unsafe { color_map.as_ref() }.map(|cm| ColorMapObject {
 })
 ```
 
+For an `init` entry point receiving a caller-allocated struct with an owned
+pointer field (`state: Option<CBox<State>>`), plain assignment drops garbage
+bytes and `mem::forget(mem::replace(..))` reads them (both UB): call
+`safer_cffi::overwrite_without_drop(&mut s.state, None)` at the top of each
+`init` entry point in `ffi.rs` so code further down the call stack never sees an
+invalid field (no `unsafe` needed), or use `Handle<State>`.
+
 ### Aliased arguments
 
 A reference parameter must stay valid until the function returns, even if it is
@@ -601,8 +656,10 @@ A panic in an `extern "C"` function aborts the process where C returns an error.
 On data C controls (arguments, file contents, callback results, field values),
 treat every `unwrap`, `expect`, `slice[i]`, `try_into().expect(..)` and signed
 `as usize` as a bug: use `.get()`/`.get_mut()`, `first_chunk::<N>()` and
-`try_from`, and map the failure to the C error code. Allocations whose failure C
-reports need the `try_*` APIs.
+`try_from`, and map the failure to the C error code. For C-controlled allocation
+sizes whose failure C reports, use safe `try_*` APIs (`try_reserve_exact`,
+`try_clone_and_leak`, `try_push_back`, `FromZeros::new_box_zeroed`), not
+hand-rolled `unsafe` `try_box_in` helpers.
 
 The exception is a struct that breaks its own safety invariant, such as a null
 array with a non-zero count or a negative count. It is already corrupt, and C
@@ -614,7 +671,7 @@ Don't                                                                           
 :----------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------ | :--
 `pub unsafe extern "C" fn f(p: *mut T)` + `if p.is_null()` + `&mut *p`               | `pub extern "C" fn f(p: Option<&mut T>)`                                              | Same ABI, no `unsafe`, null handled by the type.
 `Box::into_raw` / `Box::from_raw` for opaque objects                                 | `OpaqueTracker` + `Handle<T>`                                                         | `from_raw` on a stale or forged pointer is UB; the tracker returns `Err`.
-`&CStr`, `&str`, `String` in an `extern "C"` signature                               | `Option<CStrRef<'_>>` (input) / `clone_and_leak` of bytes (output)                    | Rust strings are fat pointers; not a `char*`.
+`&CStr`, `&str`, `String` in an `extern "C"` signature                               | `Option<CStrRef<'_>>` (in/borrowed out) / `clone_and_leak` (owned out)                | Rust strings are fat pointers; not a `char*`.
 `Option<Box<T>>` for a pointer C may have `malloc`ed                                 | `Option<CBox<T>>`                                                                     | Allocator mismatch on drop.
 `Handle<T>` for a struct whose fields appear in the header                           | `#[repr(C)] T` with `Option<&mut T>` / `Option<Box<T>>`                               | C code reads the fields through the pointer.
 `TRACKER.borrow_mut(h).unwrap()`                                                     | `let Ok(mut x) = TRACKER.borrow_mut(h) else { return ERR }`                           | Panics abort across `extern "C"`.
@@ -643,9 +700,16 @@ Returning an out-param in `Ok(..)`, or splitting the core function around it    
 Safe `extern "C" fn` that trusts one parameter to match another (slot + count)       | `unsafe extern "C" fn` with a `# Safety` section                                      | Safe Rust callers could pass mismatched values.
 "Safe" helpers for raw pointers (`ptr_as_mut`, `slice_from_raw`, `box_from_raw`)     | Ditch the helper (use safe signature types or inline `unsafe`), or mark `unsafe fn`   | They have safety preconditions; omitting `unsafe` hides unsoundness behind a safe API.
 `pub type foo_ptr = *mut Foo;` for a C pointer `typedef`                             | `pub type foo_ptr<'a> = Option<&'a mut Foo>;` (or `CBufPtr<T>` for array typedefs)    | Raw-pointer aliases hide `*mut` behind a C name and infect every function and callback using the alias with `unsafe`.
-Returning `*mut T` or `*const T` from an `extern "C"` fn, callback, or helper        | Return `Option<Box<T>>`, `Option<CBox<T>>`, `OwnedCBufPtr<T>`, `CBufPtr<T>`, or `&T`  | Raw pointer returns erase ownership and lifetime contracts and force callers into `unsafe`.
+Returning `*mut T` or `*const T` from an `extern "C"` fn, callback, or helper        | Return `Option<Box/CBox/CStrRef>`, `OwnedCBufPtr`, `CBufPtr`, or `Option<&T>`         | Raw pointer returns erase ownership and lifetime contracts and force callers into `unsafe`.
 Raw pointers (`*mut T`, `*const T`) in C callback `fn` pointer fields or typedefs    | `Option<unsafe extern "C" fn(ctx: Option<&mut Foo>, ...)>`                            | Callbacks implemented in or called from Rust then use safe references instead of raw pointer dereferences.
 Wrapping a whole function body or surrounding safe code in `unsafe { ... }`          | Put only the single `unsafe` invocation inside `unsafe { ... }`                       | Large `unsafe` blocks obscure which call has preconditions and disable safety checks across safe code.
 Resetting the count or returning early when the array is null but the count is not   | Let `as_vec_mut` panic                                                                | The struct is already corrupt, and C only copes with it by accident.
 Hardcoding `LibcAlloc` / `OwnedCBufPtr` when a C struct has `alloc`/`free` hooks     | Wrap the hooks in `CLikeAlloc<F>` (see `src/alloc.rs`) and use `CBufPtr` + `*_in`     | Callers and leak tests hook those callbacks; stateful `CLikeAlloc<F>`s do not implement `DropByPtrAllocator`.
-`CBox::new_in(State::new(), alloc)` for state of hundreds of KB                      | `#[derive(FromZeros)]` and `try_new_zeroed_in`                                        | The value is built on the stack first, which overflows C threads' stacks.
+`CBox::new_in` for huge state (hundreds of KB+) or `Box::new_zeroed().assume_init()` | `#[derive(zerocopy::FromZeros)]` + `new_box_zeroed()` / `new_box_zeroed_in(alloc)`    | `new_in` is fine for small structs but overflows stacks on huge ones; `assume_init()` adds `unsafe`.
+`pub unsafe extern "C" fn my_free(p: *mut c_void)` calling `libc::free(p)`           | `pub extern "C" fn my_free(p: OwnedCBufPtr<u8>) { drop(p); }`                         | Safe signature, handles null, encodes `LibcAlloc` ownership.
+`(ptr: *const T, len)` + `slice::from_raw_parts` in `extern "C"` fns                 | `ptr: CBufPtr<T>` (`CBufPtr<u8>` for `void*`) + `unsafe { ptr.with_len(len) }`        | Same ABI; checks null/zero/negative/overflowing lengths.
+Putting C state types or single-use FFI helpers in `allocate.rs`                     | Keep C types in `c_types.rs`, allocator impl in `allocate.rs`, inline one-off calls   | Keeps module responsibilities clear and `unsafe` easy to audit.
+Hand-rolling `unsafe` `try_box_in` / `try_box_zeroed_in` in a port                   | `CBox::new_in` or upstream to `safer_cffi`; `FromZeros` for zeroed boxes              | General allocator primitives belong in `safer_cffi` or `zerocopy`.
+Mixing `LibcAlloc.allocate` with raw `libc::free` / `libc::realloc`                  | Use `LibcAlloc` (`deallocate_by_ptr`, `OwnedCBufPtr`, `grow`/`shrink`) symmetrically  | Keeps allocator semantics and alignment handling uniform.
+`unsafe fn allocator(&mut self)` on a struct with allocator hooks                    | Safe `fn allocator(&self)` with `.unwrap_or(default_fn)` via field invariant          | Avoids `unsafe` and `&mut self` at every call site.
+`s.state = None`, `mem::replace`, or `ptr::write` on an uninit `Option<CBox<_>>`     | Call `safer_cffi::overwrite_without_drop(&mut s.state, None)` in `ffi.rs` `init`      | Assignment drops garbage, `replace` reads it (UB), `ptr::write` adds `unsafe`.
