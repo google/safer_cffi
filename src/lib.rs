@@ -83,7 +83,7 @@ pub use c_vec::CVecRefMut;
 pub use core::alloc::Allocator;
 pub use errors::{AllocError, TrackerError};
 pub use handle::Handle;
-pub use mem::overwrite_without_drop;
+pub use mem::{box_try_new_in, overwrite_without_drop};
 #[allow(deprecated)]
 pub use tracker::Tracker;
 pub use tracker::{ArcTrackerStorage, OpaqueTracker, TrackedRef, TrackedRefMut, TrackerStorage};
