@@ -8,6 +8,10 @@
 
 //! Memory helpers for C FFI boundaries.
 
+use core::alloc::{AllocError, Allocator, Layout};
+use core::mem::MaybeUninit;
+use core::ptr::NonNull;
+
 /// Overwrites `*dst` with `src` without reading or dropping the previous value.
 ///
 /// Use this at C FFI `init` entry points that receive a partially-initialized `#[repr(C)]` struct
@@ -61,11 +65,62 @@ pub const fn overwrite_without_drop<T>(dst: &mut T, src: T) {
     unsafe { core::ptr::write(dst, src) };
 }
 
+/// Fallibly allocates memory in `alloc` and places `value` into it.
+///
+/// This is a stable-API equivalent of [`Box::try_new_in`] for constructing a [`Box`] whose
+/// allocation failure must be reported as [`Err(AllocError)`] rather than aborting or panicking.
+///
+/// This does not allocate if `T` is zero-sized.
+///
+/// # Errors
+///
+/// Returns `Err(AllocError)` if `alloc.allocate` fails.
+///
+/// # Example
+///
+/// ```
+/// use safer_cffi::{box_try_new_in, LibcAlloc};
+///
+/// let boxed = box_try_new_in(42u32, LibcAlloc)?;
+/// assert_eq!(*boxed, 42);
+/// # Ok::<(), safer_cffi::AllocError>(())
+/// ```
+#[inline]
+pub fn box_try_new_in<T, A: Allocator>(value: T, alloc: A) -> Result<Box<T, A>, AllocError> {
+    let ptr: NonNull<MaybeUninit<T>> = if size_of::<T>() == 0 {
+        NonNull::dangling()
+    } else {
+        alloc.allocate(Layout::new::<MaybeUninit<T>>())?.cast()
+    };
+    // SAFETY:
+    // Contract from `Box::from_raw_in` (see `alloc::boxed`'s "Memory layout" section):
+    // - If `size_of_val` of the pointee (`size_of::<MaybeUninit<T>>() == size_of::<T>()`) is
+    //   non-zero, `ptr` must point to a block of memory currently allocated by `alloc` such that
+    //   `Layout::for_value` fits that block, and `ptr` must not already be owned by another `Box`.
+    // - If `size_of_val` of the pointee is zero, `ptr` must be a non-null pointer sufficiently
+    //   aligned for `MaybeUninit<T>`.
+    // - The pointee must be a valid instance of `MaybeUninit<T>`.
+    // Evidence:
+    // - If `size_of::<T>() == 0`, `NonNull::<MaybeUninit<T>>::dangling()` is non-null and aligned
+    //   to `align_of::<MaybeUninit<T>>()`.
+    // - If `size_of::<T>() != 0`, `alloc.allocate(Layout::new::<MaybeUninit<T>>())` succeeded and
+    //   returned an unaliased block currently allocated by `alloc`; by the `Allocator` trait safety
+    //   invariant, `.cast()` is properly aligned and `Layout::for_value` (which equals
+    //   `Layout::new::<MaybeUninit<T>>()` for `Sized` `T`) fits the allocated block. Moving `alloc`
+    //   into `Box::from_raw_in` pairs the block with the same allocator that allocated it.
+    // - Any byte pattern (including uninitialized bytes) is a valid `MaybeUninit<T>`.
+    let uninit = unsafe { Box::from_raw_in(ptr.as_ptr(), alloc) };
+    Ok(Box::write(uninit, value))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alloc::{CBox, LibcAlloc};
+    use crate::testing::TrackingAlloc;
     use core::cell::Cell;
     use core::mem::MaybeUninit;
+    use core::sync::atomic::Ordering;
     use googletest::prelude::*;
 
     #[repr(C)]
@@ -170,5 +225,87 @@ mod tests {
             *slot
         };
         expect_that!(VAL, eq(99));
+    }
+
+    struct FailingAlloc;
+
+    // SAFETY: `allocate` always fails without returning a block, so `deallocate` is unreachable for
+    // valid blocks (`Allocator::deallocate` preconditions cannot be met).
+    unsafe impl Allocator for FailingAlloc {
+        fn allocate(&self, _layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+            Err(AllocError)
+        }
+
+        unsafe fn deallocate(&self, _ptr: NonNull<u8>, _layout: Layout) {}
+    }
+
+    #[gtest]
+    fn box_try_new_in_allocates_and_drops_value() {
+        let tracker = TrackingAlloc::default();
+        let drops = Cell::new(0);
+        {
+            let boxed: CBox<(u32, DropCounter<'_>), &TrackingAlloc> =
+                box_try_new_in((42, DropCounter(&drops)), &tracker).expect("allocation succeeds");
+            expect_that!(boxed.0, eq(42));
+            expect_that!(tracker.alloc_count.load(Ordering::SeqCst), eq(1));
+            expect_that!(tracker.dealloc_count.load(Ordering::SeqCst), eq(0));
+            expect_that!(drops.get(), eq(0));
+        }
+        expect_that!(tracker.dealloc_count.load(Ordering::SeqCst), eq(1));
+        expect_that!(drops.get(), eq(1));
+    }
+
+    #[gtest]
+    fn box_try_new_in_libc_alloc_succeeds() {
+        let boxed = box_try_new_in(123u64, LibcAlloc).expect("LibcAlloc succeeds");
+        expect_that!(*boxed, eq(123));
+    }
+
+    #[gtest]
+    fn box_try_new_in_propagates_alloc_error_and_drops_value() {
+        struct NonZstDrop<'a>(#[allow(dead_code)] u64, &'a Cell<usize>);
+        impl Drop for NonZstDrop<'_> {
+            fn drop(&mut self) {
+                self.1.set(self.1.get() + 1);
+            }
+        }
+        assert!(size_of::<NonZstDrop<'_>>() > 0);
+
+        let drops = Cell::new(0);
+        let res = box_try_new_in(NonZstDrop(7, &drops), FailingAlloc);
+        expect_true!(res.is_err());
+        expect_that!(drops.get(), eq(1));
+    }
+
+    #[gtest]
+    fn box_try_new_in_handles_zst_without_allocating() {
+        #[repr(align(64))]
+        struct AlignedZst;
+        assert_eq!(size_of::<AlignedZst>(), 0);
+
+        let tracker = TrackingAlloc::default();
+        let aligned =
+            box_try_new_in(AlignedZst, &tracker).expect("aligned ZST should not allocate");
+        expect_that!(core::ptr::from_ref(&*aligned) as usize % 64, eq(0));
+        drop(aligned);
+        expect_that!(tracker.alloc_count.load(Ordering::SeqCst), eq(0));
+        expect_that!(tracker.dealloc_count.load(Ordering::SeqCst), eq(0));
+
+        // Ensure ZST path bypasses `FailingAlloc` and still drops `value`.
+        static ZST_DROPS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+        struct DroppingZst;
+        impl Drop for DroppingZst {
+            fn drop(&mut self) {
+                ZST_DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        assert_eq!(size_of::<DroppingZst>(), 0);
+
+        let before = ZST_DROPS.load(Ordering::SeqCst);
+        let zst_boxed =
+            box_try_new_in(DroppingZst, FailingAlloc).expect("Drop ZST should not allocate");
+        expect_that!(ZST_DROPS.load(Ordering::SeqCst), eq(before));
+        drop(zst_boxed);
+        expect_that!(ZST_DROPS.load(Ordering::SeqCst), eq(before + 1));
     }
 }
